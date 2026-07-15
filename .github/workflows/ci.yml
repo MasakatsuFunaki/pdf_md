@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 ships gcc 11 and windows-2022 ships MSVC v19x; both
+          # match the prebuilt pdfium binaries on ConanCenter (Linux gcc 11,
+          # Windows msvc 192). A newer image would miss the cache and force
+          # pdfium to build from source (Chromium-scale — not viable on a runner).
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: windows-2022
+            name: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0"
+
+      # Conan 2 cache: ~/.conan2. pdfium is a large dependency; caching it (keyed
+      # on conanfile.py so any dep change refills) turns cold ~build-from-download
+      # runs into near-instant warm ones.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Conan profile detect
+        run: conan profile detect --force
+
+      # build.py runs the whole flow (conan install -> cmake configure -> build)
+      # and picks the right preset for the host OS. --test runs the ctest suite.
+      - name: Build + run tests
+        run: python build.py --test
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.name }}
+          path: |
+            build/**/Testing/**
+            build/test_output/**
+          if-no-files-found: ignore
