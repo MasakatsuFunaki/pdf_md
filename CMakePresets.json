@@ -1,0 +1,67 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 23,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "conan-linux-release",
+            "displayName": "Conan Linux Release",
+            "description": "Configure with the Conan-generated toolchain (run 'conan install .' first)",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/Release",
+            "cacheVariables": {
+                "CMAKE_POLICY_DEFAULT_CMP0091": "NEW",
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "toolchainFile": "${sourceDir}/build/Release/generators/conan_toolchain.cmake"
+        },
+        {
+            "name": "conan-windows-release",
+            "displayName": "Conan Windows x64 Release (Visual Studio 2022)",
+            "description": "Configure with the Conan-generated toolchain (run 'conan install .' first)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_POLICY_DEFAULT_CMP0091": "NEW"
+            },
+            "toolchainFile": "${sourceDir}/build/generators/conan_toolchain.cmake"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "conan-linux-release",
+            "configurePreset": "conan-linux-release",
+            "configuration": "Release"
+        },
+        {
+            "name": "conan-windows-release",
+            "configurePreset": "conan-windows-release",
+            "configuration": "Release"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "conan-linux-release",
+            "configurePreset": "conan-linux-release",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "conan-windows-release",
+            "configurePreset": "conan-windows-release",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}

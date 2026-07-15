@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the artifacts (e.g. v0.1.0-dev). Used for manual runs; tag pushes use the tag name and also cut a GitHub Release.'
+        required: true
+        default: 'v0.0.0-dev'
+
+permissions:
+  contents: write   # required for the release job to create the GitHub Release
+
+env:
+  # On a tag push github.event.inputs.version is empty, so this falls back to the
+  # tag name (e.g. v0.2.0); a manual run supplies the label explicitly.
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned to match the prebuilt pdfium binaries on ConanCenter — see ci.yml.
+        include:
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: windows-2022
+            name: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Conan 2
+        run: pip install "conan>=2.0"
+
+      # Same cache key as ci.yml, so a release cut right after a green CI is warm.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Conan profile detect
+        run: conan profile detect --force
+
+      # Tests gate the release: a failing ctest fails the job, so the packaging
+      # steps below never run and no artifact is produced for a broken build.
+      - name: Build + run tests
+        run: python build.py --test
+
+      # The binary lands at build/Release/pdf2md[.exe] on both hosts (the Windows
+      # VS preset builds into build/, the Linux preset into build/Release).
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp build/Release/pdf2md dist/
+          cp README.md LICENSE dist/
+          tar -czf "pdf2md-${VERSION}-linux-x64.tar.gz" -C dist .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/pdf2md.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "pdf2md-$env:VERSION-windows-x64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf2md-${{ env.VERSION }}-${{ matrix.name }}
+          path: |
+            pdf2md-${{ env.VERSION }}-*.tar.gz
+            pdf2md-${{ env.VERSION }}-*.zip
+          if-no-files-found: error
+
+  # Only tag pushes cut a Release; a manual workflow_dispatch stops at the
+  # uploaded artifacts so dev builds don't clutter the Releases tab.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}   # v0.1.0-rc1 -> prerelease, v0.1.0 -> stable

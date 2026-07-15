@@ -1,0 +1,5 @@
+build/
+CMakeUserPresets.json
+tests/corpus/cache/
+demo_last_run_release_*/
+CLAUDE.md
