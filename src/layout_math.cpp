@@ -766,10 +766,15 @@ bool line_needs_math(const Line& line) {
 
 // A math run that is exactly `\text{WORD}^{digits}` — a whole prose word carrying
 // nothing but a pure-number superscript — is a footnote reference, not real math
-// (a genuine power sits on a single/italic variable, e.g. `W^O` or `x^2`). Returns
-// {WORD, digits} on a match.
+// (a genuine power sits on a single/italic variable, e.g. `W^O` or `x^2`). The run
+// may carry the word spaces that separate it from its neighbours; those sit
+// outside the `$...$` when written, so they are not part of the superscript.
+// Returns {WORD, digits} on a match, with any leading spaces kept on the word.
 std::optional<std::pair<std::u32string, std::u32string>> match_footnote_ref(
-    const std::u32string& t) {
+    const std::u32string& raw) {
+    size_t lead = raw.find_first_not_of(U' ');
+    if (lead == std::u32string::npos) return std::nullopt;
+    std::u32string t = raw.substr(lead, raw.find_last_not_of(U' ') + 1 - lead);
     const std::u32string pfx = U"\\text{";
     if (t.size() < pfx.size() + 1 || t.compare(0, pfx.size(), pfx) != 0) return std::nullopt;
     size_t i = pfx.size();
@@ -792,7 +797,7 @@ std::optional<std::pair<std::u32string, std::u32string>> match_footnote_ref(
         ++i;
     }
     if (i != t.size()) return std::nullopt;  // the superscript must be the whole run
-    return std::make_pair(word, digits);
+    return std::make_pair(std::u32string(lead, U' ') + word, digits);
 }
 
 // Rewrites footnote-reference math runs into a prose word plus a literal `[^n]`
@@ -813,7 +818,9 @@ void rewrite_footnote_refs(Line& line) {
             out.push_back(std::move(word));
             StyledRun ref;
             ref.raw = true;
-            ref.text = U"[^" + m->second + U"]";
+            // The run's own trailing spaces still separate it from the next word.
+            ref.text = U"[^" + m->second + U"]" +
+                       std::u32string(r.text.size() - 1 - r.text.find_last_not_of(U' '), U' ');
             out.push_back(std::move(ref));
         } else {
             out.push_back(std::move(r));

@@ -261,7 +261,13 @@ void absorb_math_fragments(std::vector<Line>& lines, double body_size) {
                 // The fragment is the shorter, small member of the pair.
                 if (ns > nh || ns > std::max<size_t>(6, nh * 2 / 5)) continue;
                 double gap = std::fabs(lines[s].baseline - host.baseline);
-                if (gap >= 0.9 * body_size) continue;  // a real line, not a stack
+                // Line-spacing reference: the host's own size, never above the
+                // document body size. Regions set in small type — UML/figure
+                // labels, code listings, footnotes — are leaded to *their* size,
+                // so measuring their spacing against the body size would read
+                // every ordinary line as a numerator and interleave the two.
+                double leading = std::min(body_size, host.size);
+                if (gap >= 0.9 * leading) continue;  // a real line, not a stack
                 // A numerator/denominator/limit sits horizontally *inside* the
                 // line it belongs to. Two ordinary short lines set side by side
                 // (scattered figure labels) fail this and are left alone.
@@ -556,7 +562,14 @@ void region_to_blocks(std::vector<Line> lines, int page, const AnalyzeParams& pa
             else if (footnote) new_block = true;
             else if (is_mono != (cur->kind == BlockKind::Code)) new_block = true;
             else if (size_delta > 0.15 * std::max(ln.size, prev.size)) new_block = true;
-            else if (gap > 1.45 * st.median_gap + 0.01 || gap > 2.1 * std::max(ln.size, prev.size))
+            // A region that mixes prose with a table or a figure legend has a
+            // median gap set by the smaller type, which would read every
+            // ordinary prose leading as a paragraph break. No line is ever led
+            // tighter than its own size, so the region median only counts as
+            // the expected leading when it is at least that.
+            else if (gap > 1.45 * std::max(st.median_gap,
+                                           1.2 * std::max(ln.size, prev.size)) + 0.01 ||
+                     gap > 2.1 * std::max(ln.size, prev.size))
                 new_block = true;
             else if (cur->kind != BlockKind::Code && prev_short && !hanging_cont &&
                      !(cur->kind == BlockKind::ListItem && std::fabs(ln.x0 - list_content_x) < 1.0 * st.median_size))

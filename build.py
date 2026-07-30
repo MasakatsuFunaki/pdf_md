@@ -8,6 +8,7 @@ import argparse
 PROJECT_ROOT = os.path.dirname(os.path.realpath(__file__))
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
 DEFAULT_PRESET = "conan-windows-release" if IS_WINDOWS else "conan-linux-release"
 
 # Conan writes CMakeUserPresets.json at the repo root and *accumulates* one
@@ -102,6 +103,18 @@ def main():
     if args.with_corpus:
         print("\n--- Downloading corpus PDFs ---")
         run_cmd(["pwsh", os.path.join("tests", "corpus", "download_corpus.ps1")])
+
+    # On aarch64 (e.g. Raspberry Pi 5 with a 16 KB-page kernel) ConanCenter has no
+    # prebuilt pdfium binary, so pdfium is built from source here anyway. Its bundled
+    # PartitionAlloc assumes 4 KB pages and SIGTRAPs at init on a 16 KB-page kernel, so
+    # we export a locally-patched pdfium recipe (conan/pdfium) that adds the aarch64
+    # 16 KB-page config. This is local-only; the newest recipe revision wins, so the
+    # following `conan install` resolves and builds our patched pdfium from source.
+    # x86_64 / Windows are untouched: they keep resolving ConanCenter's official recipe
+    # and its prebuilt binary (no source build).
+    if IS_AARCH64:
+        print("\n--- Exporting patched pdfium recipe (aarch64 16 KB pages) ---")
+        run_cmd(["conan", "export", os.path.join("conan", "pdfium"), "--version", "95.0.4629"])
 
     print("\n--- Running Conan ---")
     # On Linux, deps that wrap OS libraries declare Conan `*/system` packages.
