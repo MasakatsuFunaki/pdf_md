@@ -206,6 +206,30 @@ void header_footer(HPDF_Page page, const Fonts& fonts, int page_no) {
     text_at(page, fonts.regular, 9, 290, 36, footer.c_str());
 }
 
+bool is_escaped_at(std::string_view text, std::size_t index) noexcept {
+    std::size_t backslashes = 0;
+    while (index > backslashes && text[index - 1U - backslashes] == '\\') {
+        ++backslashes;
+    }
+    return (backslashes % 2U) != 0U;
+}
+
+std::size_t find_unescaped_close_bracket_paren(std::string_view markdown,
+                                               std::size_t start) noexcept {
+    std::size_t search = start;
+    while (search < markdown.size()) {
+        const std::size_t pos = markdown.find("](", search);
+        if (pos == std::string_view::npos) {
+            return std::string_view::npos;
+        }
+        if (!is_escaped_at(markdown, pos)) {
+            return pos;
+        }
+        search = pos + 2U;
+    }
+    return std::string_view::npos;
+}
+
 }  // namespace
 
 ScopedSandbox::ScopedSandbox(std::string_view tag) {
@@ -270,51 +294,66 @@ void write_binary_bytes(const std::filesystem::path& path,
     }
 }
 
-std::vector<std::string> extract_markdown_image_paths(std::string_view markdown) {
-    std::vector<std::string> paths;
+std::vector<MarkdownImageEmbed> extract_markdown_images(std::string_view markdown) {
+    std::vector<MarkdownImageEmbed> embeds;
     std::size_t pos = 0;
     while (pos < markdown.size()) {
         const std::size_t bang = markdown.find("![", pos);
         if (bang == std::string_view::npos) {
             break;
         }
-        const std::size_t mid = markdown.find("](", bang + 2);
+        if (is_escaped_at(markdown, bang)) {
+            pos = bang + 2U;
+            continue;
+        }
+        const std::size_t mid = find_unescaped_close_bracket_paren(markdown, bang + 2U);
         if (mid == std::string_view::npos) {
             break;
         }
-        const std::string_view alt = markdown.substr(bang + 2, mid - (bang + 2));
+        const std::string_view alt = markdown.substr(bang + 2U, mid - (bang + 2U));
         if (alt.find('\n') != std::string_view::npos) {
-            pos = bang + 2;
+            pos = bang + 2U;
             continue;
         }
-        if (mid + 2 < markdown.size() && markdown[mid + 2] == '<') {
-            const std::size_t close_angle = markdown.find(">)", mid + 3);
+        if (mid + 2U < markdown.size() && markdown[mid + 2U] == '<') {
+            const std::size_t close_angle = markdown.find(">)", mid + 3U);
             if (close_angle == std::string_view::npos) {
                 break;
             }
-            const std::string_view wrapped = markdown.substr(mid + 3, close_angle - (mid + 3));
+            const std::string_view wrapped =
+                markdown.substr(mid + 3U, close_angle - (mid + 3U));
             if (wrapped.empty() || wrapped.find('\n') != std::string_view::npos) {
-                pos = mid + 3;
+                pos = mid + 3U;
                 continue;
             }
-            paths.emplace_back(wrapped);
-            pos = close_angle + 2;
+            embeds.push_back(MarkdownImageEmbed{std::string(alt), std::string(wrapped)});
+            pos = close_angle + 2U;
             continue;
         }
-        const std::size_t close = markdown.find(')', mid + 2);
+        const std::size_t close = markdown.find(')', mid + 2U);
         if (close == std::string_view::npos) {
             break;
         }
-        std::string_view target = markdown.substr(mid + 2, close - (mid + 2));
+        std::string_view target = markdown.substr(mid + 2U, close - (mid + 2U));
         if (target.size() >= 2U && target.front() == '<' && target.back() == '>') {
-            target = target.substr(1, target.size() - 2);
+            target = target.substr(1U, target.size() - 2U);
         }
         if (target.empty() || target.find('\n') != std::string_view::npos) {
-            pos = mid + 2;
+            pos = mid + 2U;
             continue;
         }
-        paths.emplace_back(target);
-        pos = close + 1;
+        embeds.push_back(MarkdownImageEmbed{std::string(alt), std::string(target)});
+        pos = close + 1U;
+    }
+    return embeds;
+}
+
+std::vector<std::string> extract_markdown_image_paths(std::string_view markdown) {
+    const std::vector<MarkdownImageEmbed> embeds = extract_markdown_images(markdown);
+    std::vector<std::string> paths;
+    paths.reserve(embeds.size());
+    for (const MarkdownImageEmbed& embed : embeds) {
+        paths.push_back(embed.path);
     }
     return paths;
 }
@@ -1012,6 +1051,271 @@ void make_encrypted(const std::filesystem::path& out,
     HPDF_SetEncryptionMode(pdf, HPDF_ENCRYPT_R3, kRc4KeyLengthBytes);
 
     save_pdf_to_path(pdf, out);
+}
+
+void make_rich_features(const std::filesystem::path& out) {
+    Doc doc;
+    HPDF_Doc pdf = doc.get();
+
+    HPDF_SetInfoAttr(pdf, HPDF_INFO_TITLE, "Quarterly Architecture Specification");
+    HPDF_SetInfoAttr(pdf, HPDF_INFO_AUTHOR, "Ada Lovelace");
+    HPDF_SetInfoAttr(pdf, HPDF_INFO_SUBJECT, "Systems Conversion Pipeline");
+    HPDF_SetInfoAttr(pdf, HPDF_INFO_KEYWORDS, "pdf, markdown, layout");
+    const HPDF_Date creation_date{2026, 3, 15, 14, 30, 0, 'Z', 0, 0};
+    const HPDF_Date mod_date{2026, 3, 16, 8, 45, 0, '+', 2, 0};
+    HPDF_SetInfoDateAttr(pdf, HPDF_INFO_CREATION_DATE, creation_date);
+    HPDF_SetInfoDateAttr(pdf, HPDF_INFO_MOD_DATE, mod_date);
+
+    const Fonts fonts = load_fonts(pdf);
+    constexpr float kLeftMargin = 72.0f;
+    constexpr float kNestedListIndent = 100.0f;
+    constexpr float kRightDividerEdge = 540.0f;
+    constexpr float kTitleSize = 22.0f;
+    constexpr float kSectionSize = 16.0f;
+    constexpr float kBodySize = 11.0f;
+    constexpr float kMidlineStrikeOffset = 3.0f;
+    constexpr float kAnnotPadX = 0.5f;
+    constexpr float kAnnotBottomOffset = 3.0f;
+    constexpr float kAnnotTopOffset = 10.0f;
+    constexpr float kUnitZoom = 1.0f;
+
+    HPDF_Page p1 = add_letter_page(pdf);
+    text_at(p1, fonts.bold, kTitleSize, kLeftMargin, 720.0f,
+            "Quarterly Architecture Specification");
+    text_at(p1, fonts.bold, kSectionSize, kLeftMargin, 680.0f, "Overview Section");
+
+    // Paragraph combining an explicit URI link annotation and a bare prose WebLink.
+    constexpr float kLinkBaseline = 646.0f;
+    const char* link_prefix = "Consult the ";
+    const char* link_label = "architecture guide";
+    const char* link_suffix = " or mirror https://example.org/docs_v2/~spec for updates.";
+    text_at(p1, fonts.regular, kBodySize, kLeftMargin, kLinkBaseline, link_prefix);
+    const float uri_x = kLeftMargin + text_width(p1, fonts.regular, kBodySize, link_prefix);
+    const float uri_w = text_width(p1, fonts.regular, kBodySize, link_label);
+    text_at(p1, fonts.regular, kBodySize, uri_x, kLinkBaseline, link_label);
+    text_at(p1, fonts.regular, kBodySize, uri_x + uri_w, kLinkBaseline, link_suffix);
+    const HPDF_Rect uri_rect{uri_x - kAnnotPadX, kLinkBaseline - kAnnotBottomOffset,
+                             uri_x + uri_w + kAnnotPadX, kLinkBaseline + kAnnotTopOffset};
+    HPDF_Page_CreateURILinkAnnot(p1, uri_rect, "https://example.org/arch-guide");
+
+    // Paragraph combining a PDF StrikeOut markup annotation and a thin vector midline rule.
+    constexpr float kStrikeBaseline = 610.0f;
+    const char* strike_prefix = "Retire ";
+    const char* strike_annot_word = "deprecated endpoint";
+    const char* strike_mid = " and ";
+    const char* strike_rule_word = "obsolete token";
+    const char* strike_suffix = " immediately.";
+    float cursor_x = kLeftMargin;
+    text_at(p1, fonts.regular, kBodySize, cursor_x, kStrikeBaseline, strike_prefix);
+    cursor_x += text_width(p1, fonts.regular, kBodySize, strike_prefix);
+    const float s1_x = cursor_x;
+    const float s1_w = text_width(p1, fonts.regular, kBodySize, strike_annot_word);
+    text_at(p1, fonts.regular, kBodySize, s1_x, kStrikeBaseline, strike_annot_word);
+    cursor_x += s1_w;
+    text_at(p1, fonts.regular, kBodySize, cursor_x, kStrikeBaseline, strike_mid);
+    cursor_x += text_width(p1, fonts.regular, kBodySize, strike_mid);
+    const float s2_x = cursor_x;
+    const float s2_w = text_width(p1, fonts.regular, kBodySize, strike_rule_word);
+    text_at(p1, fonts.regular, kBodySize, s2_x, kStrikeBaseline, strike_rule_word);
+    cursor_x += s2_w;
+    text_at(p1, fonts.regular, kBodySize, cursor_x, kStrikeBaseline, strike_suffix);
+
+    const HPDF_Rect strike_rect{s1_x + kAnnotPadX, kStrikeBaseline - kAnnotBottomOffset,
+                                s1_x + s1_w - kAnnotPadX, kStrikeBaseline + kAnnotTopOffset};
+    HPDF_Annotation strike_annot =
+        HPDF_Page_CreateStrikeOutAnnot(p1, strike_rect, "Deprecated API", nullptr);
+    const HPDF_Point quad_lb{strike_rect.left, strike_rect.bottom};
+    const HPDF_Point quad_rb{strike_rect.right, strike_rect.bottom};
+    const HPDF_Point quad_lt{strike_rect.left, strike_rect.top};
+    const HPDF_Point quad_rt{strike_rect.right, strike_rect.top};
+    HPDF_TextMarkupAnnot_SetQuadPoints(strike_annot, quad_lb, quad_rb, quad_lt, quad_rt);
+    draw_line(p1, s2_x, kStrikeBaseline + kMidlineStrikeOffset, s2_x + s2_w,
+              kStrikeBaseline + kMidlineStrikeOffset);
+
+    // Body-sized unbolded line promoted to `###` solely via child `/FitH` PDF Outline.
+    constexpr float kSubHeadingBaseline = 572.0f;
+    text_at(p1, fonts.regular, kBodySize, kLeftMargin, kSubHeadingBaseline,
+            "Bookmark Promoted Subsection");
+    text_at(p1, fonts.regular, kBodySize, kLeftMargin, 536.0f,
+            "Paragraph above the thematic section divider.");
+
+    // Standalone horizontal thematic rule clear of headings, tables, and chrome.
+    draw_line(p1, kLeftMargin, 502.0f, kRightDividerEdge, 502.0f);
+
+    // Literal GFM task list items (unchecked, checked, nested checked).
+    text_at(p1, fonts.regular, kBodySize, kLeftMargin, 468.0f, "[ ] Draft protocol schema");
+    text_at(p1, fonts.regular, kBodySize, kLeftMargin, 452.0f, "[x] Validate binary framing");
+    text_at(p1, fonts.regular, kBodySize, kNestedListIndent, 436.0f,
+            "[X] Record golden checksums");
+
+    // Page 2: root bookmark section, aligned 3-column table, and captioned image.
+    HPDF_Page p2 = add_letter_page(pdf);
+    text_at(p2, fonts.bold, kSectionSize, kLeftMargin, 720.0f, "Verification Matrix");
+
+    constexpr std::size_t kTableRows = 4;
+    constexpr std::size_t kTableCols = 3;
+    constexpr float kCol0LeftX = 72.0f;
+    constexpr float kCol1CenterX = 285.0f;
+    constexpr float kCol2RightX = 490.0f;
+    constexpr float kTableStartY = 680.0f;
+    constexpr float kTableRowStep = 18.0f;
+    constexpr const char* kCells[kTableRows][kTableCols] = {
+        {"Component", "Status", "Latency"},
+        {"Extractor", "OK", "9"},
+        {"Layout Engine", "VERIFIED", "1,240"},
+        {"Writer", "PASS", "128,500"},
+    };
+    for (std::size_t r = 0; r < kTableRows; ++r) {
+        const HPDF_Font row_font = (r == 0U) ? fonts.bold : fonts.regular;
+        const float row_y = kTableStartY - static_cast<float>(r) * kTableRowStep;
+        text_at(p2, row_font, kBodySize, kCol0LeftX, row_y, kCells[r][0]);
+        const float col1_w = text_width(p2, row_font, kBodySize, kCells[r][1]);
+        text_at(p2, row_font, kBodySize, kCol1CenterX - 0.5f * col1_w, row_y, kCells[r][1]);
+        const float col2_w = text_width(p2, row_font, kBodySize, kCells[r][2]);
+        text_at(p2, row_font, kBodySize, kCol2RightX - col2_w, row_y, kCells[r][2]);
+    }
+
+    constexpr int kImgDim = 8;
+    constexpr int kRgbChannels = 3;
+    constexpr float kDrawImgWidth = 96.0f;
+    constexpr float kDrawImgHeight = 72.0f;
+    constexpr std::array<HPDF_BYTE, 4> kEdgeByteSeam = {0x00U, 0x7FU, 0x80U, 0xFFU};
+    std::array<HPDF_BYTE, kImgDim * kImgDim * kRgbChannels> pixels{};
+    for (int yy = 0; yy < kImgDim; ++yy) {
+        for (int xx = 0; xx < kImgDim; ++xx) {
+            const auto cell = static_cast<std::size_t>(xx + yy * 2);
+            const auto base = static_cast<std::size_t>((yy * kImgDim + xx) * kRgbChannels);
+            pixels[base] = kEdgeByteSeam[cell % kEdgeByteSeam.size()];
+            pixels[base + 1] = kEdgeByteSeam[(cell + 1U) % kEdgeByteSeam.size()];
+            pixels[base + 2] = kEdgeByteSeam[(cell + 2U) % kEdgeByteSeam.size()];
+        }
+    }
+    HPDF_Image fig = HPDF_LoadRawImageFromMem(
+        pdf, pixels.data(), kImgDim, kImgDim, HPDF_CS_DEVICE_RGB, kExpectedPngBitDepth);
+    HPDF_Page_DrawImage(p2, fig, kLeftMargin, 470.0f, kDrawImgWidth, kDrawImgHeight);
+    text_at(p2, fonts.regular, kBodySize, kLeftMargin, 448.0f,
+            "Figure 1: Pipeline stage throughput overview.");
+    text_at(p2, fonts.regular, kBodySize, kLeftMargin, 408.0f,
+            "Closing verification paragraph after the captioned figure.");
+
+    // Hierarchical PDF Outline tree mixing `/XYZ` and `/FitH` destinations.
+    HPDF_Outline bm_overview = HPDF_CreateOutline(pdf, nullptr, "Overview Section", nullptr);
+    HPDF_Destination dst_overview = HPDF_Page_CreateDestination(p1);
+    HPDF_Destination_SetXYZ(dst_overview, kLeftMargin, 692.0f, kUnitZoom);
+    HPDF_Outline_SetDestination(bm_overview, dst_overview);
+
+    HPDF_Outline bm_sub =
+        HPDF_CreateOutline(pdf, bm_overview, "Bookmark Promoted Subsection", nullptr);
+    HPDF_Destination dst_sub = HPDF_Page_CreateDestination(p1);
+    HPDF_Destination_SetFitH(dst_sub, kSubHeadingBaseline + 8.0f);
+    HPDF_Outline_SetDestination(bm_sub, dst_sub);
+
+    HPDF_Outline bm_matrix = HPDF_CreateOutline(pdf, nullptr, "Verification Matrix", nullptr);
+    HPDF_Destination dst_matrix = HPDF_Page_CreateDestination(p2);
+    HPDF_Destination_SetFitH(dst_matrix, 732.0f);
+    HPDF_Outline_SetDestination(bm_matrix, dst_matrix);
+
+    save_pdf_to_path(pdf, out);
+}
+
+void make_math_and_tasks(const std::filesystem::path& out) {
+    // `/ToUnicode` mapping on `/F3`:
+    //   'A' (0x41) -> U+221A (radical sign)
+    //   'B' (0x42) -> U+03C0 (Greek small letter pi)
+    //   'C' (0x43) -> U+2610 (ballot box, unchecked)
+    //   'D' (0x44) -> U+2611 (ballot box with check, checked)
+    const std::string cmap =
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        "/CMapName /Adobe-Identity-UCS def\n"
+        "/CMapType 2 def\n"
+        "1 begincodespacerange\n"
+        "<00> <FF>\n"
+        "endcodespacerange\n"
+        "4 beginbfchar\n"
+        "<41> <221A>\n"
+        "<42> <03C0>\n"
+        "<43> <2610>\n"
+        "<44> <2611>\n"
+        "endbfchar\n"
+        "endcmap\n"
+        "CMapName currentdict /CMap defineresource pop\n"
+        "end\n"
+        "end\n";
+
+    std::string page;
+    page += "BT /F1 18 Tf 72 720 Td (Mathematical and Task Verification) Tj ET\n";
+    page += "BT /F2 11 Tf 72 680 Td "
+            "(Body prose establishes consistent baseline metrics across the page so) Tj ET\n";
+    page += "BT /F2 11 Tf 72 665 Td "
+            "(rule anchored stacked fractions and vinculum radicals reconstruct cleanly.) Tj ET\n";
+
+    // Equation 1 (y=595): rule-anchored stacked fraction `\frac{x+1}{y+2} = \sqrt{2\pi}`
+    //   - Fraction bar at y=598 spanning x=[258, 281]
+    //   - Numerator `x+1` above bar at y=603; denominator `y+2` below bar at y=583
+    //   - Tight `=` at x=284, radical `<41>` at x=292.5 with vinculum y=603, x=[299.5, 316]
+    page += "0.75 w 258 598 m 281 598 l S\n";
+    page += "BT /F2 9 Tf 261 603 Td (x+1) Tj ET\n";
+    page += "BT /F2 9 Tf 261 583 Td (y+2) Tj ET\n";
+    page += "BT /F2 11 Tf 284 595 Td (=) Tj ET\n";
+    page += "BT /F3 11 Tf 292.5 595 Td <41> Tj ET\n";
+    page += "0.75 w 299.5 603 m 316 603 l S\n";
+    page += "BT /F2 11 Tf 300.5 595 Td (2) Tj /F3 11 Tf 6.2 0 Td <42> Tj ET\n";
+
+    // Equation 2 (y=548): indexed radical with vinculum `\sqrt[3]{z+1} = k`
+    //   - Hook index `3` (6.5pt at x=268.5, y=553.5) preceding radical `<41>` at x=271, y=548
+    //   - Vinculum bar at y=556 spanning x=[278, 297.5] over `z+1`, followed by `=k` at x=302
+    page += "BT /F2 6.5 Tf 268.5 553.5 Td (3) Tj ET\n";
+    page += "BT /F3 11 Tf 271 548 Td <41> Tj ET\n";
+    page += "0.75 w 278 556 m 297.5 556 l S\n";
+    page += "BT /F2 11 Tf 279.5 548 Td (z+1) Tj 22.5 0 Td (=k) Tj ET\n";
+
+    // Unicode ballot-box task list (`U+2610` unchecked, `U+2611` checked).
+    page += "BT /F3 11 Tf 72 504 Td <43> Tj /F2 11 Tf 8 0 Td "
+            "( Calibrate optical baseline) Tj ET\n";
+    page += "BT /F3 11 Tf 72 488 Td <44> Tj /F2 11 Tf 8 0 Td "
+            "( Verify vinculum geometry) Tj ET\n";
+
+    // Tagged `/Figure` marked-content sequence (`MCID 0`) carrying `/Alt` text.
+    page += "/Figure <</MCID 0>> BDC q 96 0 0 72 72 376 cm /Im1 Do Q EMC\n";
+    page += "BT /F2 11 Tf 72 336 Td "
+            "(Trailing paragraph beneath the tagged schematic figure.) Tj ET\n";
+
+    constexpr std::size_t kImgPixelCount = 16;
+    constexpr std::array<char, 4> kEdgeChars = {'\x00', '\x7F', '\x80', '\xFF'};
+    std::string img_pixels;
+    img_pixels.reserve(kImgPixelCount * 3U);
+    for (std::size_t i = 0; i < kImgPixelCount; ++i) {
+        img_pixels.push_back(kEdgeChars[i % kEdgeChars.size()]);
+        img_pixels.push_back(kEdgeChars[(i + 1U) % kEdgeChars.size()]);
+        img_pixels.push_back(kEdgeChars[(i + 3U) % kEdgeChars.size()]);
+    }
+
+    const std::vector<std::string> objs = {
+        "1 0 obj<</Type/Catalog/Pages 2 0 R/MarkInfo<</Marked true>>"
+        "/StructTreeRoot 9 0 R>>endobj\n",
+        "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/StructParents 0"
+        "/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R/F3 7 0 R>>"
+        "/XObject<</Im1 12 0 R>>>>>>endobj\n",
+        make_obj_stream(4, "", page),
+        "5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>endobj\n",
+        "6 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n",
+        "7 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica"
+        "/FirstChar 65/LastChar 68/Widths[667 667 722 722]/ToUnicode 8 0 R>>endobj\n",
+        make_obj_stream(8, "", cmap),
+        "9 0 obj<</Type/StructTreeRoot/K[10 0 R]/ParentTree 11 0 R>>endobj\n",
+        "10 0 obj<</Type/StructElem/S/Figure/P 9 0 R/Pg 3 0 R/K 0"
+        "/Alt(Tagged schematic alt description)>>endobj\n",
+        "11 0 obj<</Nums[0[10 0 R]]>>endobj\n",
+        make_obj_stream(12,
+                        "/Type/XObject/Subtype/Image/Width 4/Height 4"
+                        "/ColorSpace/DeviceRGB/BitsPerComponent 8",
+                        img_pixels),
+    };
+    write_raw_pdf_objects(out, objs);
 }
 
 }  // namespace pdf2md::testfx

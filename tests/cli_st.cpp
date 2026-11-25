@@ -432,18 +432,22 @@ void assert_valid_png(const fs::path& png_path, PngHeaderInfo* out_info = nullpt
     }
 }
 
+std::string_view strip_trailing_line_break(std::string_view text) noexcept {
+    if (!text.empty() && text.back() == '\n') {
+        text.remove_suffix(1);
+    }
+    if (!text.empty() && text.back() == '\r') {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
 // Verifies default non-quiet stderr holds strictly the single conversion summary
 // milestone line (`pdf2md: converted <N> page(s), <M> block(s)...`) with zero
 // unexpected warning, error, or debug lines.
 void assert_summary_milestone_stderr(std::string_view stderr_bytes, int expected_pages = -1) {
     ASSERT_FALSE(stderr_bytes.empty()) << "Expected conversion summary line on stderr";
-    std::string_view trimmed = stderr_bytes;
-    if (!trimmed.empty() && trimmed.back() == '\n') {
-        trimmed.remove_suffix(1);
-    }
-    if (!trimmed.empty() && trimmed.back() == '\r') {
-        trimmed.remove_suffix(1);
-    }
+    const std::string_view trimmed = strip_trailing_line_break(stderr_bytes);
     EXPECT_EQ(trimmed.find('\n'), std::string_view::npos)
         << "Unexpected extra lines on stderr: " << stderr_bytes;
     EXPECT_EQ(trimmed.find('\r'), std::string_view::npos)
@@ -530,6 +534,71 @@ void make_rotated_watermark_pdf(const fs::path& out) {
     HPDF_Page_EndText(page);
 
     HPDF_SaveToFile(pdf, out.string().c_str());
+}
+
+void make_hyperlink_pdf(const fs::path& out) {
+    ScopedHpdfDoc holder;
+    HPDF_Doc pdf = holder.get();
+    HPDF_Font regular = HPDF_GetFont(pdf, "Helvetica", "WinAnsiEncoding");
+    HPDF_Page page = HPDF_AddPage(pdf);
+    HPDF_Page_SetSize(page, HPDF_PAGE_SIZE_LETTER, HPDF_PAGE_PORTRAIT);
+
+    constexpr float kFontSizePt = 12.0f;
+    constexpr float kMarginLeftPt = 72.0f;
+    constexpr float kBaselineYPt = 700.0f;
+    constexpr float kLinkBottomPadPt = 3.0f;
+    constexpr float kLinkTopPadPt = 2.0f;
+    constexpr const char* kPrefix = "Visit ";
+    constexpr const char* kAnchor = "Project Portal";
+    constexpr const char* kLine = "Visit Project Portal for updates.";
+
+    HPDF_Page_SetFontAndSize(page, regular, kFontSizePt);
+    const float prefix_width = HPDF_Page_TextWidth(page, kPrefix);
+    const float anchor_width = HPDF_Page_TextWidth(page, kAnchor);
+
+    HPDF_Page_BeginText(page);
+    HPDF_Page_SetFontAndSize(page, regular, kFontSizePt);
+    HPDF_Page_TextOut(page, kMarginLeftPt, kBaselineYPt, kLine);
+    HPDF_Page_EndText(page);
+
+    const HPDF_Rect link_rect = {
+        kMarginLeftPt + prefix_width,
+        kBaselineYPt - kLinkBottomPadPt,
+        kMarginLeftPt + prefix_width + anchor_width,
+        kBaselineYPt + kFontSizePt + kLinkTopPadPt,
+    };
+    HPDF_Annotation annot =
+        HPDF_Page_CreateURILinkAnnot(page, link_rect, "https://example.org/portal");
+    HPDF_LinkAnnot_SetBorderStyle(annot, 0.0f, 0, 0);
+
+    HPDF_SaveToFile(pdf, out.string().c_str());
+}
+
+void assert_basic_toc_ordering(const std::string& md_basic_toc) {
+    const size_t toc_first = md_basic_toc.find("- [First Section](#first-section)");
+    const size_t toc_lists = md_basic_toc.find("- [Lists](#lists)");
+    const size_t toc_code = md_basic_toc.find("- [Code Example](#code-example)");
+    const size_t toc_hyph = md_basic_toc.find("- [Hyphenation](#hyphenation)");
+    const size_t toc_bold =
+        md_basic_toc.find("- [Bold Pseudo Heading Section](#bold-pseudo-heading-section)");
+    const size_t body_first_sec = md_basic_toc.find("## First Section\n");
+    ASSERT_NE(toc_first, std::string::npos) << md_basic_toc;
+    ASSERT_NE(toc_lists, std::string::npos) << md_basic_toc;
+    ASSERT_NE(toc_code, std::string::npos) << md_basic_toc;
+    ASSERT_NE(toc_hyph, std::string::npos) << md_basic_toc;
+    ASSERT_NE(toc_bold, std::string::npos) << md_basic_toc;
+    ASSERT_NE(body_first_sec, std::string::npos) << md_basic_toc;
+    EXPECT_LT(toc_first, toc_lists);
+    EXPECT_LT(toc_lists, toc_code);
+    EXPECT_LT(toc_code, toc_hyph);
+    EXPECT_LT(toc_hyph, toc_bold);
+    EXPECT_LT(toc_bold, body_first_sec);
+    const size_t toc_title =
+        md_basic_toc.find("- [Sample Document Title](#sample-document-title)");
+    if (toc_title != std::string::npos) {
+        EXPECT_LT(toc_title, toc_first);
+        EXPECT_THAT(md_basic_toc, HasSubstr("  - [First Section](#first-section)"));
+    }
 }
 
 void make_encrypted_pdf(const fs::path& out, const char* owner_pw, const char* user_pw) {
@@ -684,20 +753,33 @@ TEST(Cli, MultiFeatureOptionsAndImageExtraction) {
     const fs::path derived_img_dir = sandbox.dir() / "default_img_images";
     const CliResult res_default_img = run_cli({image_pdf, "-o", default_img_md});
     ASSERT_EQ(res_default_img.exit_code, kExitOk) << res_default_img.stderr_bytes;
+    EXPECT_TRUE(res_default_img.stdout_bytes.empty());
     assert_summary_milestone_stderr(res_default_img.stderr_bytes, 1);
-    EXPECT_THAT(read_text(default_img_md), HasSubstr("![](default_img_images/image_1.png)"));
-    assert_valid_png(derived_img_dir / "image_1.png");
+    const std::string default_img_body = read_text(default_img_md);
+    EXPECT_THAT(default_img_body, HasSubstr("A paragraph above the picture."));
+    EXPECT_THAT(default_img_body, HasSubstr("![](default_img_images/image_1.png)"));
+    EXPECT_THAT(default_img_body, HasSubstr("A paragraph below the picture."));
+    const std::vector<fs::path> default_pngs = list_regular_files_sorted(derived_img_dir);
+    ASSERT_EQ(default_pngs.size(), 1U);
+    EXPECT_EQ(default_pngs[0].filename(), fs::path("image_1.png"));
+    PngHeaderInfo default_png_info{};
+    assert_valid_png(default_pngs[0], &default_png_info);
+    EXPECT_EQ(default_png_info.width, png_info.width);
+    EXPECT_EQ(default_png_info.height, png_info.height);
+    EXPECT_EQ(read_bytes(default_pngs[0]), read_bytes(custom_pngs[0]));
 
     // `--no-images`: suppresses image extraction and omits directory creation.
     const fs::path no_img_md = sandbox.dir() / "suppressed_img.md";
     const fs::path suppressed_img_dir = sandbox.dir() / "suppressed_img_images";
     const CliResult res_no_img = run_cli({image_pdf, "-o", no_img_md, "--no-images"});
     ASSERT_EQ(res_no_img.exit_code, kExitOk) << res_no_img.stderr_bytes;
+    EXPECT_TRUE(res_no_img.stdout_bytes.empty());
     assert_summary_milestone_stderr(res_no_img.stderr_bytes, 1);
     const std::string no_img_body = read_text(no_img_md);
     EXPECT_THAT(no_img_body, HasSubstr("A paragraph above the picture."));
     EXPECT_THAT(no_img_body, HasSubstr("A paragraph below the picture."));
-    EXPECT_THAT(no_img_body, Not(HasSubstr("![](")));
+    EXPECT_THAT(no_img_body, Not(HasSubstr("![")));
+    EXPECT_THAT(no_img_body, Not(HasSubstr(".png")));
     EXPECT_FALSE(fs::exists(suppressed_img_dir));
 
     EXPECT_EQ(read_bytes(basic_pdf), basic_before);
@@ -713,32 +795,41 @@ TEST(Cli, LayoutFlagsAlterOutputPerContract) {
     const fs::path basic_pdf = sandbox.dir() / "basic.pdf";
     const fs::path table_pdf = sandbox.dir() / "table.pdf";
     const fs::path rotated_pdf = sandbox.dir() / "rotated.pdf";
+    const fs::path links_pdf = sandbox.dir() / "links.pdf";
     pdf2md::testfx::make_basic(basic_pdf);
     pdf2md::testfx::make_table(table_pdf);
     make_rotated_watermark_pdf(rotated_pdf);
+    make_hyperlink_pdf(links_pdf);
 
     const std::vector<uint8_t> basic_before = read_bytes(basic_pdf);
     const std::vector<uint8_t> table_before = read_bytes(table_pdf);
     const std::vector<uint8_t> rotated_before = read_bytes(rotated_pdf);
+    const std::vector<uint8_t> links_before = read_bytes(links_pdf);
 
-    // Baseline basic conversion vs `--keep-headers` and `--no-headings`.
+    // Baseline basic conversion vs `--keep-headers`, `--no-headings`, and `--toc`.
     const fs::path basic_default_md = sandbox.dir() / "basic_default.md";
     const fs::path basic_headers_md = sandbox.dir() / "basic_keep_headers.md";
     const fs::path basic_nohead_md = sandbox.dir() / "basic_no_headings.md";
+    const fs::path basic_toc_md = sandbox.dir() / "basic_toc.md";
 
     const CliResult r_basic_def = run_cli({basic_pdf, "-o", basic_default_md});
     const CliResult r_basic_hdr = run_cli({basic_pdf, "-o", basic_headers_md, "--keep-headers"});
     const CliResult r_basic_noh = run_cli({basic_pdf, "-o", basic_nohead_md, "--no-headings"});
+    const CliResult r_basic_toc = run_cli({basic_pdf, "-o", basic_toc_md, "--toc"});
     ASSERT_EQ(r_basic_def.exit_code, kExitOk);
     ASSERT_EQ(r_basic_hdr.exit_code, kExitOk);
     ASSERT_EQ(r_basic_noh.exit_code, kExitOk);
+    ASSERT_EQ(r_basic_toc.exit_code, kExitOk) << r_basic_toc.stderr_bytes;
+    EXPECT_TRUE(r_basic_toc.stdout_bytes.empty());
     assert_summary_milestone_stderr(r_basic_def.stderr_bytes, 3);
     assert_summary_milestone_stderr(r_basic_hdr.stderr_bytes, 3);
     assert_summary_milestone_stderr(r_basic_noh.stderr_bytes, 3);
+    assert_summary_milestone_stderr(r_basic_toc.stderr_bytes, 3);
 
     const std::string md_basic_def = read_text(basic_default_md);
     const std::string md_basic_hdr = read_text(basic_headers_md);
     const std::string md_basic_noh = read_text(basic_nohead_md);
+    const std::string md_basic_toc = read_text(basic_toc_md);
 
     EXPECT_THAT(md_basic_def, Not(HasSubstr("PDF2MD Fixture Suite")));
     EXPECT_THAT(md_basic_def, Not(HasSubstr("Page 2")));
@@ -752,6 +843,10 @@ TEST(Cli, LayoutFlagsAlterOutputPerContract) {
     EXPECT_THAT(md_basic_noh, Not(HasSubstr("## First Section")));
     EXPECT_THAT(md_basic_noh, HasSubstr("Sample Document Title"));
     EXPECT_THAT(md_basic_noh, HasSubstr("First Section"));
+
+    EXPECT_THAT(md_basic_def, Not(HasSubstr("- [First Section](#first-section)")));
+    EXPECT_THAT(md_basic_def, Not(HasSubstr("- [Sample Document Title](#sample-document-title)")));
+    assert_basic_toc_ordering(md_basic_toc);
 
     // Baseline table conversion vs `--no-tables`.
     const fs::path table_default_md = sandbox.dir() / "table_default.md";
@@ -793,9 +888,30 @@ TEST(Cli, LayoutFlagsAlterOutputPerContract) {
     EXPECT_THAT(md_rot_kept, HasSubstr("Standard horizontal body paragraph stays readable."));
     EXPECT_THAT(md_rot_kept, HasSubstr("CONFIDENTIALSTAMP"));
 
+    // Baseline URI hyperlink emission vs `--no-links`.
+    const fs::path links_default_md = sandbox.dir() / "links_default.md";
+    const fs::path links_disabled_md = sandbox.dir() / "links_disabled.md";
+    const CliResult r_lnk_def = run_cli({links_pdf, "-o", links_default_md});
+    const CliResult r_lnk_off = run_cli({links_pdf, "-o", links_disabled_md, "--no-links"});
+    ASSERT_EQ(r_lnk_def.exit_code, kExitOk) << r_lnk_def.stderr_bytes;
+    ASSERT_EQ(r_lnk_off.exit_code, kExitOk) << r_lnk_off.stderr_bytes;
+    EXPECT_TRUE(r_lnk_def.stdout_bytes.empty());
+    EXPECT_TRUE(r_lnk_off.stdout_bytes.empty());
+    assert_summary_milestone_stderr(r_lnk_def.stderr_bytes, 1);
+    assert_summary_milestone_stderr(r_lnk_off.stderr_bytes, 1);
+
+    const std::string md_lnk_def = read_text(links_default_md);
+    const std::string md_lnk_off = read_text(links_disabled_md);
+    EXPECT_THAT(md_lnk_def,
+                HasSubstr("Visit [Project Portal](https://example.org/portal) for updates."));
+    EXPECT_THAT(md_lnk_off, HasSubstr("Visit Project Portal for updates."));
+    EXPECT_THAT(md_lnk_off, Not(HasSubstr("[Project Portal](")));
+    EXPECT_THAT(md_lnk_off, Not(HasSubstr("https://example.org/portal")));
+
     EXPECT_EQ(read_bytes(basic_pdf), basic_before);
     EXPECT_EQ(read_bytes(table_pdf), table_before);
     EXPECT_EQ(read_bytes(rotated_pdf), rotated_before);
+    EXPECT_EQ(read_bytes(links_pdf), links_before);
 }
 
 TEST(Cli, UnicodeAndSpacedFilesystemPaths) {
@@ -868,11 +984,14 @@ TEST(Cli, ErrorExitCodeContractsAndZeroPartialOutput) {
     const CliResult res_help = run_cli({"--help"});
     EXPECT_EQ(res_help.exit_code, kExitOk);
     EXPECT_THAT(res_help.stdout_bytes, HasSubstr("--pages"));
+    EXPECT_THAT(res_help.stdout_bytes, HasSubstr("--no-images"));
+    EXPECT_THAT(res_help.stdout_bytes, HasSubstr("--toc"));
+    EXPECT_THAT(res_help.stdout_bytes, HasSubstr("--no-links"));
     EXPECT_TRUE(res_help.stderr_bytes.empty());
 
     const CliResult res_version = run_cli({"--version"});
     EXPECT_EQ(res_version.exit_code, kExitOk);
-    EXPECT_FALSE(res_version.stdout_bytes.empty());
+    EXPECT_EQ(strip_trailing_line_break(res_version.stdout_bytes), "pdf2md 0.2.0");
     EXPECT_TRUE(res_version.stderr_bytes.empty());
 
     const fs::path unlocked_md = sandbox.dir() / "unlocked.md";
@@ -891,6 +1010,7 @@ TEST(Cli, ErrorExitCodeContractsAndZeroPartialOutput) {
 
     const fs::path missing_pdf = sandbox.dir() / "does_not_exist.pdf";
     const fs::path corrupt_img_dir = sandbox.dir() / "corrupt_imgs";
+    const fs::path conflict_img_dir = sandbox.dir() / "conflict_imgs";
     const std::vector<ErrorCase> cases = {
         {"missing_required_input", {}, kExitBadArgs, fs::path{}},
         {"unknown_flag",
@@ -905,6 +1025,11 @@ TEST(Cli, ErrorExitCodeContractsAndZeroPartialOutput) {
          {valid_pdf, "--pages", "abc", "-o", sandbox.dir() / "err_pages_nan.md"},
          kExitBadArgs,
          sandbox.dir() / "err_pages_nan.md"},
+        {"conflicting_images_and_no_images",
+         {valid_pdf, "--images", conflict_img_dir, "--no-images", "-o",
+          sandbox.dir() / "err_conflict_images.md"},
+         kExitBadArgs,
+         sandbox.dir() / "err_conflict_images.md"},
         {"missing_input_pdf",
          {missing_pdf, "-o", sandbox.dir() / "err_missing.md"},
          kExitPdfError,
@@ -923,7 +1048,7 @@ TEST(Cli, ErrorExitCodeContractsAndZeroPartialOutput) {
          fs::path{}},
     };
 
-    ASSERT_EQ(cases.size(), 8U);
+    ASSERT_EQ(cases.size(), 9U);
     for (const ErrorCase& tc : cases) {
         SCOPED_TRACE(tc.name);
         const CliResult res = run_cli(tc.args);
@@ -937,6 +1062,7 @@ TEST(Cli, ErrorExitCodeContractsAndZeroPartialOutput) {
         }
     }
 
+    EXPECT_FALSE(fs::exists(conflict_img_dir));
     EXPECT_TRUE(list_regular_files_sorted(corrupt_img_dir).empty());
     EXPECT_TRUE(fs::is_directory(existing_dir));
     EXPECT_TRUE(list_regular_files_sorted(existing_dir).empty());

@@ -49,6 +49,11 @@ struct PngConsumerReport {
     std::uint32_t bits_per_component = 0;
 };
 
+struct MarkdownImageEmbed {
+    std::string alt;
+    std::string path;
+};
+
 // Reads the exact binary contents of `path`. Throws std::runtime_error if `path`
 // cannot be opened for reading.
 std::vector<std::uint8_t> read_binary_bytes(const std::filesystem::path& path);
@@ -56,6 +61,9 @@ std::vector<std::uint8_t> read_binary_bytes(const std::filesystem::path& path);
 // Writes `bytes` verbatim to `path` (creating parent directories if needed).
 void write_binary_bytes(const std::filesystem::path& path,
                         const std::vector<std::uint8_t>& bytes);
+
+// Extracts every `(alt, target)` pair from Markdown `![alt](target)` image embeds in order.
+std::vector<MarkdownImageEmbed> extract_markdown_images(std::string_view markdown);
 
 // Extracts every target path from Markdown `![alt](target)` image embeds in order.
 std::vector<std::string> extract_markdown_image_paths(std::string_view markdown);
@@ -123,5 +131,19 @@ void make_multi_image_dedup(const std::filesystem::path& out);
 void make_encrypted(const std::filesystem::path& out,
                     const std::string& owner_password,
                     const std::string& user_password);
+
+// Two-page PDF exercising rich metadata (Subject, Keywords, CreationDate, ModDate),
+// hierarchical PDF Outlines (/XYZ and /FitH destinations promoting body-sized headings),
+// explicit URI link annotations + bare prose WebLinks, StrikeOut annotations + thin
+// vector midline strikethrough rules, standalone horizontal divider rule, literal GFM
+// task lists, center/right-aligned table columns, and an embedded RGB image paired
+// with an adjacent "Figure 1: ..." caption.
+void make_rich_features(const std::filesystem::path& out);
+
+// One-page PDF with `/ToUnicode` math & ballot-box glyphs exercising rule-anchored
+// stacked fractions (`\frac`), vinculum + indexed radicals (`\sqrt{2\pi}`, `\sqrt[3]{...}`),
+// Unicode ballot-box task lists (`U+2610`/`U+2611`), and a Tagged PDF `/StructTreeRoot`
+// `/Figure` element carrying `/Alt` text on an embedded image XObject.
+void make_math_and_tasks(const std::filesystem::path& out);
 
 }  // namespace pdf2md::testfx

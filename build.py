@@ -1,9 +1,9 @@
-
+import argparse
+from datetime import datetime
 import os
 import platform
 import shutil
 import subprocess
-import argparse
 
 PROJECT_ROOT = os.path.dirname(os.path.realpath(__file__))
 
@@ -39,28 +39,46 @@ def rm(path):
 
 def generate_demo():
     """Run the freshly built pdf2md over the project's PDFs into a
-    demo_last_run_release_<git-hash> folder at the repo root."""
+    build/demo_last_run_release_<YYYY-MM-DD_HH-MM-SS> folder."""
     exe = os.path.join(BUILD_DIR, "Release", "pdf2md.exe" if IS_WINDOWS else "pdf2md")
     if not os.path.isfile(exe):
         print(f"pdf2md binary not found at {exe}; skipping demo generation")
         return
 
-    git_hash = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        check=True, capture_output=True, text=True, cwd=PROJECT_ROOT,
-    ).stdout.strip()
-    demo_dir = os.path.join(PROJECT_ROOT, f"demo_last_run_release_{git_hash}")
-    rm(demo_dir)
-    os.makedirs(demo_dir)
+    demo_prefix = "demo_last_run_release_"
+    for parent in (PROJECT_ROOT, BUILD_DIR):
+        if not os.path.isdir(parent):
+            continue
+        for entry in sorted(os.listdir(parent)):
+            if entry.startswith(demo_prefix):
+                rm(os.path.join(parent, entry))
 
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    demo_dir = os.path.join(BUILD_DIR, f"{demo_prefix}{timestamp}")
+    os.makedirs(demo_dir, exist_ok=True)
+
+    cmake_build_dir = BUILD_DIR if IS_WINDOWS else os.path.join(BUILD_DIR, "Release")
     pdf_dirs = [
         os.path.join(PROJECT_ROOT, "tests", "corpus", "cache"),
-        os.path.join(BUILD_DIR, "test_output"),
-        os.path.join(BUILD_DIR, "test_output", "fixtures"),
+        os.path.join(BUILD_DIR, "examples"),
+        os.path.join(cmake_build_dir, "examples"),
+        os.path.join(cmake_build_dir, "test_output"),
+        os.path.join(cmake_build_dir, "test_output", "fixtures"),
     ]
-    pdfs = [os.path.join(d, f)
-            for d in pdf_dirs if os.path.isdir(d)
-            for f in sorted(os.listdir(d)) if f.lower().endswith(".pdf")]
+    pdfs = []
+    seen_names = set()
+    for d in pdf_dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            key = f.lower()
+            if not key.endswith(".pdf") or key in seen_names:
+                continue
+            full_path = os.path.join(d, f)
+            if os.path.isfile(full_path):
+                seen_names.add(key)
+                pdfs.append(full_path)
+    pdfs.sort(key=lambda p: os.path.basename(p).lower())
     if not pdfs:
         print("No PDFs found (corpus not fetched / tests not run); demo folder left empty")
         return

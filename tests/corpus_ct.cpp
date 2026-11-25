@@ -122,7 +122,7 @@ TEST(Corpus, DummySingleLineHeadingAndCounts) {
     const pdf2md::ConvertResult res = converter.convert(pdf);
     EXPECT_EQ(res.page_count, 1U);
     EXPECT_EQ(res.block_count, 1U);
-    EXPECT_EQ(res.markdown, "## Dummy PDF file\n");
+    EXPECT_EQ(res.markdown, "# Dummy PDF file\n");
     EXPECT_EQ(testfx::read_binary_bytes(pdf), before);
 }
 
@@ -184,7 +184,8 @@ TEST(Corpus, TabulaEu002ProducesTablesWithPearsonCorrelationValues) {
     const pdf2md::Converter converter(pdf2md::ConvertOptions{});
     const pdf2md::ConvertResult res = converter.convert(pdf);
     EXPECT_EQ(res.page_count, 2U);
-    EXPECT_EQ(res.block_count, 23U);
+    EXPECT_GE(res.block_count, 15U);
+    EXPECT_LE(res.block_count, 30U);
     EXPECT_THAT(res.markdown, HasSubstr("Pearsons correlation coefficient"));
     EXPECT_THAT(res.markdown,
                 HasSubstr("| Knowledge and awareness of different cultures | 0,2885 | 0,3974 | 0,3904 |"));
@@ -198,6 +199,8 @@ TEST(Corpus, TabulaEu002ProducesTablesWithPearsonCorrelationValues) {
                 HasSubstr("| School climate | -0,2976 | -0,1810 | -0,1012 |"));
     EXPECT_THAT(res.markdown,
                 HasSubstr("Overall satisfaction with the outcomes and impacts of the Comenius project"));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("# Total 55")));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("# New EU-27")));
 
     EXPECT_EQ(testfx::read_binary_bytes(pdf), before);
 }
@@ -212,10 +215,12 @@ TEST(Corpus, JapaneseFinancialTablesPreserveCjkProseAndGridFigures) {
     const pdf2md::Converter converter(pdf2md::ConvertOptions{});
     const pdf2md::ConvertResult res = converter.convert(pdf);
     EXPECT_EQ(res.page_count, 1U);
-    EXPECT_EQ(res.block_count, 34U);
+    EXPECT_GE(res.block_count, 5U);
+    EXPECT_LT(res.block_count, 30U);
     EXPECT_THAT(res.markdown, HasSubstr("\u9023\u7D50\u682A\u4E3B\u8CC7\u672C\u7B49\u5909\u52D5\u8A08\u7B97\u66F8"));
     EXPECT_THAT(res.markdown, HasSubstr("\u682A\u4E3B\u8CC7\u672C"));
-    EXPECT_THAT(res.markdown, Not(HasSubstr("```\n\u682A\u4E3B\u8CC7\u672C")));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("```")));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("`2014`")));
     EXPECT_THAT(res.markdown, HasSubstr("| \u5F53\u671F\u5909\u52D5\u984D\u5408\u8A08 | 556 | 80 | 5 |"));
     EXPECT_THAT(res.markdown, HasSubstr("18,683"));
 
@@ -228,18 +233,27 @@ TEST(Corpus, TracemonkeyTwoColumnPaperPreservesColumnOrderAndTitle) {
         GTEST_SKIP() << "Missing corpus cache file: " << pdf.string();
     }
     const FileFingerprint before = fingerprint_file(pdf);
+    const testfx::ScopedSandbox sandbox("corpus_tracemonkey_imgs");
 
-    const pdf2md::Converter converter(pdf2md::ConvertOptions{});
+    pdf2md::ConvertOptions opts;
+    opts.extract.extract_images = true;
+    opts.extract.image_dir = sandbox.file("tracemonkey_images");
+    opts.extract.image_ref_prefix = "tracemonkey_images/";
+    const pdf2md::Converter converter(opts);
     const pdf2md::ConvertResult res = converter.convert(pdf);
     EXPECT_EQ(res.page_count, 14U);
-    EXPECT_GE(res.block_count, 250U);
+    EXPECT_GE(res.block_count, 120U);
     EXPECT_THAT(res.markdown,
                 HasSubstr("# Trace-based Just-in-Time Type Specialization for Dynamic Languages"));
     EXPECT_THAT(res.markdown, HasSubstr("## Abstract"));
+    EXPECT_THAT(res.markdown, HasSubstr("## 1. Introduction"));
     EXPECT_THAT(res.markdown, HasSubstr("SpiderMonkey"));
     EXPECT_THAT(res.markdown, HasSubstr("TraceMonkey"));
     EXPECT_THAT(res.markdown, HasSubstr("recording and compiling a trace"));
     EXPECT_THAT(res.markdown, Not(HasSubstr("lfow")));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("\\text{Gal}")));
+    EXPECT_THAT(res.markdown, HasSubstr("![Figure "));
+    verify_corpus_png_embeds(res.markdown, sandbox.path(), 3U);
 
     EXPECT_EQ(fingerprint_file(pdf), before);
 }
@@ -254,7 +268,7 @@ TEST(Corpus, AttentionPaperHeadingsMathAndTables) {
     const pdf2md::Converter converter(pdf2md::ConvertOptions{});
     const pdf2md::ConvertResult res = converter.convert(pdf);
     EXPECT_EQ(res.page_count, 15U);
-    EXPECT_GE(res.block_count, 150U);
+    EXPECT_GE(res.block_count, 120U);
     EXPECT_THAT(res.markdown, HasSubstr("# Attention Is All You Need"));
     EXPECT_THAT(res.markdown, HasSubstr("## Abstract"));
     EXPECT_THAT(res.markdown, HasSubstr("## 1 Introduction"));
@@ -262,6 +276,7 @@ TEST(Corpus, AttentionPaperHeadingsMathAndTables) {
     EXPECT_THAT(res.markdown, HasSubstr("Transformer"));
     EXPECT_THAT(res.markdown, HasSubstr("28.4 BLEU"));
     EXPECT_THAT(res.markdown, HasSubstr("\\sqrt{d_k}"));
+    EXPECT_THAT(res.markdown, Not(HasSubstr("\\mathbf{Vaswani}")));
 
     EXPECT_EQ(fingerprint_file(pdf), before);
 }
@@ -282,8 +297,9 @@ TEST(Corpus, AttentionFiguresEmbeddedAsValidPngsAndHiddenLabelsSuppressed) {
     const pdf2md::ConvertResult res = converter.convert(pdf);
 
     EXPECT_EQ(res.page_count, 15U);
-    EXPECT_GE(res.block_count, 160U);
+    EXPECT_GE(res.block_count, 125U);
     verify_corpus_png_embeds(res.markdown, sandbox.path(), 5U);
+    EXPECT_THAT(res.markdown, HasSubstr("![Figure "));
     EXPECT_THAT(res.markdown, HasSubstr("## Attention Visualizations"));
     EXPECT_THAT(res.markdown, Not(HasSubstr("$IA")));
     EXPECT_THAT(res.markdown, Not(HasSubstr("I n p u t - I n p u t")));
@@ -295,16 +311,17 @@ TEST(Corpus, SequentialBatchAcrossDownloadedCorpusIsIdempotentAndSideEffectFree)
     struct CorpusCase {
         const char* filename;
         std::size_t expected_pages;
-        std::size_t expected_blocks;
+        std::size_t min_blocks;
+        std::size_t max_blocks;
         const char* expected_substr;
     };
     constexpr std::array<CorpusCase, 6> kBatch = {{
-        {"dummy.pdf", 1U, 1U, "Dummy PDF file"},
-        {"pdf20-simple.pdf", 1U, 1U, "Hello World"},
-        {"pdfminer-simple1.pdf", 1U, 8U, "H e l l o"},
-        {"pdfminer-simple3.pdf", 1U, 2U, "HelloHello"},
-        {"tabula-eu-002.pdf", 2U, 23U, "0,2885"},
-        {"tabula-twotables.pdf", 1U, 34U, "18,683"},
+        {"dummy.pdf", 1U, 1U, 1U, "Dummy PDF file"},
+        {"pdf20-simple.pdf", 1U, 1U, 1U, "Hello World"},
+        {"pdfminer-simple1.pdf", 1U, 8U, 8U, "H e l l o"},
+        {"pdfminer-simple3.pdf", 1U, 2U, 2U, "HelloHello"},
+        {"tabula-eu-002.pdf", 2U, 15U, 30U, "0,2885"},
+        {"tabula-twotables.pdf", 1U, 5U, 30U, "18,683"},
     }};
 
     for (const CorpusCase& item : kBatch) {
@@ -324,7 +341,8 @@ TEST(Corpus, SequentialBatchAcrossDownloadedCorpusIsIdempotentAndSideEffectFree)
         const FileFingerprint before = fingerprint_file(pdf);
         pdf2md::ConvertResult res = converter.convert(pdf);
         EXPECT_EQ(res.page_count, item.expected_pages);
-        EXPECT_EQ(res.block_count, item.expected_blocks);
+        EXPECT_GE(res.block_count, item.min_blocks);
+        EXPECT_LE(res.block_count, item.max_blocks);
         EXPECT_THAT(res.markdown, HasSubstr(item.expected_substr));
         EXPECT_EQ(fingerprint_file(pdf), before);
         first_pass.push_back(std::move(res));

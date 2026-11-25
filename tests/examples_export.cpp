@@ -44,15 +44,29 @@
 namespace {
 
 namespace fs = std::filesystem;
+using ::testing::Contains;
 using ::testing::HasSubstr;
+using ::testing::Not;
 using ::testing::StartsWith;
 
 constexpr size_t kPipeChunkBytes = 4096;
 constexpr size_t kPngSignatureBytes = 8;
 constexpr size_t kIhdrChunkOffset = 8;
+constexpr size_t kChunkTypeOffset = kIhdrChunkOffset + 4;
+constexpr size_t kIhdrWidthOffset = kIhdrChunkOffset + 8;
+constexpr size_t kIhdrHeightOffset = kIhdrChunkOffset + 12;
+constexpr size_t kIhdrBitDepthOffset = kIhdrChunkOffset + 16;
+constexpr size_t kIhdrColorTypeOffset = kIhdrChunkOffset + 17;
 constexpr uint32_t kIhdrDataLength = 13;
+constexpr uint8_t kExpectedPngBitDepth = 8;
+constexpr uint8_t kPngColorGrayscale = 0;
+constexpr uint8_t kPngColorTruecolor = 2;
+constexpr uint8_t kPngColorIndexed = 3;
+constexpr uint8_t kPngColorGrayAlpha = 4;
+constexpr uint8_t kPngColorTruecolorAlpha = 6;
 constexpr size_t kMinValidPngBytes = 45;
 constexpr size_t kIendTrailerBytes = 12;
+constexpr size_t kAttentionMinFigureCount = 5;
 
 constexpr std::array<uint8_t, kPngSignatureBytes> kPngSignature = {
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
@@ -332,6 +346,12 @@ uint32_t read_be_u32(const uint8_t* p) noexcept {
            (static_cast<uint32_t>(p[2]) << 8U) | static_cast<uint32_t>(p[3]);
 }
 
+bool is_valid_png_color_type(uint8_t color_type) noexcept {
+    return color_type == kPngColorGrayscale || color_type == kPngColorTruecolor ||
+           color_type == kPngColorIndexed || color_type == kPngColorGrayAlpha ||
+           color_type == kPngColorTruecolorAlpha;
+}
+
 void assert_valid_png(const fs::path& png_path) {
     ASSERT_TRUE(fs::exists(png_path)) << "Missing PNG file: " << png_path;
     const std::vector<uint8_t> bytes = read_bytes(png_path);
@@ -340,12 +360,17 @@ void assert_valid_png(const fs::path& png_path) {
         << "Invalid PNG magic header in " << png_path;
     ASSERT_EQ(read_be_u32(bytes.data() + kIhdrChunkOffset), kIhdrDataLength)
         << "Unexpected IHDR length in " << png_path;
-    ASSERT_EQ(std::memcmp(bytes.data() + kIhdrChunkOffset + 4, kIhdrTag.data(), kIhdrTag.size()), 0)
+    ASSERT_EQ(std::memcmp(bytes.data() + kChunkTypeOffset, kIhdrTag.data(), kIhdrTag.size()), 0)
         << "Missing IHDR tag in " << png_path;
-    EXPECT_GT(read_be_u32(bytes.data() + kIhdrChunkOffset + 8), 0U)
+    EXPECT_GT(read_be_u32(bytes.data() + kIhdrWidthOffset), 0U)
         << "Zero PNG width in " << png_path;
-    EXPECT_GT(read_be_u32(bytes.data() + kIhdrChunkOffset + 12), 0U)
+    EXPECT_GT(read_be_u32(bytes.data() + kIhdrHeightOffset), 0U)
         << "Zero PNG height in " << png_path;
+    const uint8_t bit_depth = bytes[kIhdrBitDepthOffset];
+    const uint8_t color_type = bytes[kIhdrColorTypeOffset];
+    EXPECT_EQ(bit_depth, kExpectedPngBitDepth) << "Unexpected PNG bit depth in " << png_path;
+    EXPECT_TRUE(is_valid_png_color_type(color_type))
+        << "Invalid PNG color type in " << png_path;
     const uint8_t* tail = bytes.data() + (bytes.size() - kIendTrailerBytes);
     EXPECT_EQ(std::memcmp(tail, kIendTrailer.data(), kIendTrailer.size()), 0)
         << "Missing canonical IEND trailer in " << png_path;
@@ -383,22 +408,118 @@ std::vector<fs::path> collect_png_files(const fs::path& dir) {
     return pngs;
 }
 
+std::string_view trim_ascii_spaces(std::string_view text) noexcept {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+// Parses general GFM inline image embeds `![alt](dest)` and `![alt](<dest>)`,
+// tolerating escaped or nested brackets inside `alt` and balanced parentheses inside `dest`.
 std::vector<std::string> extract_markdown_image_links(std::string_view md) {
     std::vector<std::string> links;
-    constexpr std::string_view kOpen = "![](";
-    for (size_t pos = md.find(kOpen); pos != std::string_view::npos; pos = md.find(kOpen, pos)) {
-        pos += kOpen.size();
-        const size_t close = md.find(')', pos);
-        if (close == std::string_view::npos) {
+    size_t scan = 0;
+    while (scan < md.size()) {
+        const size_t bang = md.find("![", scan);
+        if (bang == std::string_view::npos) {
             break;
         }
-        links.emplace_back(md.substr(pos, close - pos));
-        pos = close + 1;
+        if (bang > 0 && md[bang - 1] == '\\') {
+            scan = bang + 2;
+            continue;
+        }
+
+        size_t pos = bang + 2;
+        size_t bracket_depth = 1;
+        while (pos < md.size() && md[pos] != '\n' && md[pos] != '\r') {
+            if (md[pos] == '\\' && pos + 1 < md.size() && md[pos + 1] != '\n' &&
+                md[pos + 1] != '\r') {
+                pos += 2;
+                continue;
+            }
+            if (md[pos] == '[') {
+                ++bracket_depth;
+                ++pos;
+                continue;
+            }
+            if (md[pos] == ']') {
+                --bracket_depth;
+                if (bracket_depth == 0) {
+                    break;
+                }
+            }
+            ++pos;
+        }
+        if (bracket_depth != 0 || pos + 1 >= md.size() || md[pos + 1] != '(') {
+            scan = bang + 2;
+            continue;
+        }
+
+        const size_t dest_start = pos + 2;
+        if (dest_start < md.size() && md[dest_start] == '<') {
+            size_t gt = dest_start + 1;
+            while (gt < md.size() && md[gt] != '>' && md[gt] != '\n' && md[gt] != '\r') {
+                if (md[gt] == '\\' && gt + 1 < md.size() && md[gt + 1] != '\n' &&
+                    md[gt + 1] != '\r') {
+                    gt += 2;
+                    continue;
+                }
+                ++gt;
+            }
+            if (gt < md.size() && md[gt] == '>' && gt + 1 < md.size() && md[gt + 1] == ')') {
+                const std::string_view target = md.substr(dest_start + 1, gt - (dest_start + 1));
+                if (!target.empty()) {
+                    links.emplace_back(target);
+                }
+                scan = gt + 2;
+                continue;
+            }
+            scan = bang + 2;
+            continue;
+        }
+
+        size_t close = dest_start;
+        size_t paren_depth = 1;
+        while (close < md.size() && md[close] != '\n' && md[close] != '\r') {
+            if (md[close] == '\\' && close + 1 < md.size() && md[close + 1] != '\n' &&
+                md[close + 1] != '\r') {
+                close += 2;
+                continue;
+            }
+            if (md[close] == '(') {
+                ++paren_depth;
+                ++close;
+                continue;
+            }
+            if (md[close] == ')') {
+                --paren_depth;
+                if (paren_depth == 0) {
+                    break;
+                }
+            }
+            ++close;
+        }
+        if (paren_depth != 0) {
+            scan = bang + 2;
+            continue;
+        }
+
+        const std::string_view target =
+            trim_ascii_spaces(md.substr(dest_start, close - dest_start));
+        if (!target.empty()) {
+            links.emplace_back(target);
+        }
+        scan = close + 1;
     }
     return links;
 }
 
 void assert_document_landmarks(std::string_view name, const std::string& md,
+                               const std::vector<std::string>& image_links,
                                const fs::path& gallery_dir) {
     if (name == "basic") {
         EXPECT_THAT(md, HasSubstr("# Sample Document Title\n"));
@@ -429,7 +550,7 @@ void assert_document_landmarks(std::string_view name, const std::string& md,
     }
     if (name == "image") {
         EXPECT_THAT(md, HasSubstr("A paragraph above the picture."));
-        EXPECT_THAT(md, HasSubstr("![](images/image/image_1.png)"));
+        EXPECT_THAT(image_links, Contains("images/image/image_1.png"));
         EXPECT_THAT(md, HasSubstr("A paragraph below the picture."));
         const std::vector<fs::path> pngs = collect_png_files(gallery_dir / "images" / "image");
         ASSERT_EQ(pngs.size(), 1U);
@@ -464,13 +585,15 @@ void assert_document_landmarks(std::string_view name, const std::string& md,
     if (name == "tabula-twotables") {
         EXPECT_THAT(md, HasSubstr("株主資本"));
         EXPECT_THAT(md, HasSubstr("12,017"));
+        EXPECT_THAT(md, Not(HasSubstr("```")));
+        EXPECT_THAT(md, Not(HasSubstr("`12,017`")));
         return;
     }
     if (name == "tracemonkey") {
         EXPECT_THAT(md, HasSubstr("# Trace-based Just-in-Time Type Specialization for Dynamic"));
         EXPECT_THAT(md, HasSubstr("## Abstract"));
         EXPECT_THAT(md, HasSubstr("recording and compiling a trace"));
-        EXPECT_THAT(md, HasSubstr("![](images/tracemonkey/image_1.png)"));
+        EXPECT_THAT(image_links, Contains("images/tracemonkey/image_1.png"));
         const std::vector<fs::path> pngs =
             collect_png_files(gallery_dir / "images" / "tracemonkey");
         ASSERT_GE(pngs.size(), 1U);
@@ -483,10 +606,11 @@ void assert_document_landmarks(std::string_view name, const std::string& md,
         EXPECT_THAT(md, HasSubstr("# Attention Is All You Need"));
         EXPECT_THAT(md, HasSubstr("## Abstract"));
         EXPECT_THAT(md, HasSubstr("## Attention Visualizations"));
-        EXPECT_THAT(md, HasSubstr("![](images/arxiv-attention/image_1.png)"));
+        EXPECT_GE(image_links.size(), kAttentionMinFigureCount);
+        EXPECT_THAT(image_links, Contains("images/arxiv-attention/image_1.png"));
         const std::vector<fs::path> pngs =
             collect_png_files(gallery_dir / "images" / "arxiv-attention");
-        ASSERT_GE(pngs.size(), 5U);
+        ASSERT_GE(pngs.size(), kAttentionMinFigureCount);
         for (const fs::path& png : pngs) {
             assert_valid_png(png);
         }
@@ -495,6 +619,7 @@ void assert_document_landmarks(std::string_view name, const std::string& md,
     if (name == "spec_document") {
         EXPECT_THAT(md, HasSubstr("\n# "));
         EXPECT_THAT(md, HasSubstr("| --- |"));
+        EXPECT_GE(image_links.size(), 1U);
         const std::vector<fs::path> pngs =
             collect_png_files(gallery_dir / "images" / "spec_document");
         ASSERT_GE(pngs.size(), 1U);
@@ -583,10 +708,14 @@ TEST(Examples, GenerateGalleryWithCli) {
 
         ASSERT_TRUE(fs::exists(md_path)) << "Missing markdown output for " << in.name;
         const std::string md = read_text(md_path);
-        assert_document_landmarks(in.name, md, dir);
-
-        // Every image link emitted in the markdown must resolve to a valid PNG on disk.
         const std::vector<std::string> links = extract_markdown_image_links(md);
+        assert_document_landmarks(in.name, md, links, dir);
+
+        if (!in.images) {
+            EXPECT_TRUE(links.empty()) << "Unexpected image links when --no-images passed for "
+                                       << in.name;
+        }
+        // Every image link emitted in the markdown must resolve to a valid PNG on disk.
         for (const std::string& rel_link : links) {
             SCOPED_TRACE(rel_link);
             assert_valid_png(dir / fs::path(rel_link));

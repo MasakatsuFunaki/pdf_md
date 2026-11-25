@@ -1,5 +1,6 @@
 #include "image_extractor.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -7,11 +8,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <memory>
 #include <optional>
 #include <random>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -20,28 +19,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
-void ensure_pdfium_initialized() {
-    static const int init_once = [] {
-        FPDF_InitLibrary();
-        return 1;
-    }();
-    (void)init_once;
-}
-
-struct BitmapDeleter {
-    void operator()(FPDF_BITMAP bmp) const noexcept {
-        if (bmp != nullptr) {
-            FPDFBitmap_Destroy(bmp);
-        }
-    }
-};
-
-using ScopedBitmap = std::unique_ptr<std::remove_pointer_t<FPDF_BITMAP>, BitmapDeleter>;
-
-ScopedBitmap make_bitmap(int width, int height, int format, void* external_buf = nullptr,
-                         int stride = 0) {
-    ensure_pdfium_initialized();
-    return ScopedBitmap(FPDFBitmap_CreateEx(width, height, format, external_buf, stride));
+pdf2md::RasterImage make_bitmap(int width, int height, pdf2md::PixelFormat format) {
+    const int bpp = pdf2md::bytes_per_pixel(format);
+    const int aligned_stride = ((width * bpp + 3) / 4) * 4;
+    return pdf2md::RasterImage(width, height, format, aligned_stride);
 }
 
 class ScopedTempDir {
@@ -137,10 +118,10 @@ std::optional<PngHeaderInfo> parse_png_wire_file(const fs::path& file_path) {
     return info;
 }
 
-void fill_bgra_rect(FPDF_BITMAP bmp, int x0, int y0, int w, int h, uint8_t b, uint8_t g, uint8_t r,
-                    uint8_t a = 0xFFU) {
-    auto* base = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bmp));
-    const int stride = FPDFBitmap_GetStride(bmp);
+void fill_bgra_rect(pdf2md::RasterImage& bmp, int x0, int y0, int w, int h, uint8_t b, uint8_t g,
+                    uint8_t r, uint8_t a = 0xFFU) {
+    uint8_t* base = bmp.pixels.data();
+    const int stride = bmp.stride;
     constexpr int kBgraChannels = 4;
     for (int y = y0; y < y0 + h; ++y) {
         uint8_t* row = base + static_cast<std::ptrdiff_t>(y) * stride;
@@ -156,32 +137,79 @@ void fill_bgra_rect(FPDF_BITMAP bmp, int x0, int y0, int w, int h, uint8_t b, ui
 
 TEST(ImageExtractor, HandlesNullBitmapsAndUnwritablePathsSafely) {
     ScopedTempDir tmp;
-    const fs::path null_out = tmp.path() / "null_bitmap.png";
+    std::vector<uint8_t> backing_buf(64U, 0x40U);
 
-    EXPECT_FALSE(pdf2md::write_bitmap_png(nullptr, null_out));
-    EXPECT_FALSE(fs::exists(null_out));
+    struct InvalidGeometryCase {
+        const char* name;
+        bool use_backing;
+        int width;
+        int height;
+        int stride;
+        pdf2md::PixelFormat format;
+    };
 
-    EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(nullptr), 0.0);
+    constexpr InvalidGeometryCase kInvalidCases[] = {
+        {"default_null_view", false, 0, 0, 0, pdf2md::PixelFormat::BGRA},
+        {"null_data_with_positive_dimensions", false, 4, 4, 16, pdf2md::PixelFormat::BGRA},
+        {"zero_width", true, 0, 4, 16, pdf2md::PixelFormat::BGRA},
+        {"negative_width", true, -4, 4, 16, pdf2md::PixelFormat::BGRA},
+        {"zero_height", true, 4, 0, 16, pdf2md::PixelFormat::BGRA},
+        {"negative_height", true, 4, -4, 16, pdf2md::PixelFormat::BGRA},
+        {"zero_stride", true, 4, 4, 0, pdf2md::PixelFormat::BGRA},
+        {"negative_stride", true, 4, 4, -16, pdf2md::PixelFormat::BGRA},
+        {"undersized_stride_below_active_row_bytes", true, 4, 4, 15, pdf2md::PixelFormat::BGRA},
+    };
+    constexpr std::size_t kExpectedInvalidCaseCount = 9;
+    ASSERT_EQ(std::size(kInvalidCases), kExpectedInvalidCaseCount);
 
-    const fs::path null_band_out = tmp.path() / "null_band.png";
-    EXPECT_FALSE(pdf2md::write_scan_band_png(nullptr, null_band_out, 2, 0.01));
-    EXPECT_FALSE(fs::exists(null_band_out));
+    for (const auto& tc : kInvalidCases) {
+        SCOPED_TRACE(tc.name);
+        const pdf2md::BitmapView invalid_bmp{
+            tc.use_backing ? backing_buf.data() : nullptr,
+            tc.width,
+            tc.height,
+            tc.stride,
+            tc.format,
+        };
+        const fs::path out_png = tmp.path() / (std::string(tc.name) + ".png");
+        const fs::path out_band = tmp.path() / (std::string(tc.name) + "_band.png");
 
-    ScopedBitmap valid_bmp = make_bitmap(4, 4, FPDFBitmap_BGRA);
-    ASSERT_NE(valid_bmp, nullptr);
-    fill_bgra_rect(valid_bmp.get(), 0, 0, 4, 4, 0x20U, 0x40U, 0x80U);
+        EXPECT_FALSE(pdf2md::write_bitmap_png(invalid_bmp, out_png));
+        EXPECT_FALSE(fs::exists(out_png));
+        EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(invalid_bmp), 0.0);
+        EXPECT_FALSE(pdf2md::write_scan_band_png(invalid_bmp, out_band, 2, 0.01));
+        EXPECT_FALSE(fs::exists(out_band));
+        EXPECT_EQ(pdf2md::hash_bitmap(invalid_bmp), pdf2md::hash_bitmap(invalid_bmp));
+    }
+
+    // RasterImage constructor guards invalid dimensions/strides and defaults stride = 0 to tight.
+    const pdf2md::RasterImage default_img;
+    EXPECT_TRUE(default_img.empty());
+    EXPECT_EQ(default_img.view().data, nullptr);
+
+    const pdf2md::RasterImage neg_stride_img(4, 4, pdf2md::PixelFormat::BGRA, -16);
+    EXPECT_TRUE(neg_stride_img.empty());
+    EXPECT_EQ(neg_stride_img.view().data, nullptr);
+
+    const pdf2md::RasterImage tight_bgr_img(5, 3, pdf2md::PixelFormat::BGR);
+    EXPECT_FALSE(tight_bgr_img.empty());
+    EXPECT_EQ(tight_bgr_img.stride, 15);
+    EXPECT_EQ(tight_bgr_img.pixels.size(), std::size_t{45});
+
+    pdf2md::RasterImage valid_bmp = make_bitmap(4, 4, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(valid_bmp.empty());
+    fill_bgra_rect(valid_bmp, 0, 0, 4, 4, 0x20U, 0x40U, 0x80U);
 
     // Passing an existing directory as the output PNG file path must fail cleanly.
-    EXPECT_FALSE(pdf2md::write_bitmap_png(valid_bmp.get(), tmp.path()));
+    EXPECT_FALSE(pdf2md::write_bitmap_png(valid_bmp.view(), tmp.path()));
 
-    // Null bitmap hash is deterministic and distinct from a populated bitmap.
-    EXPECT_EQ(pdf2md::hash_bitmap(nullptr), pdf2md::hash_bitmap(nullptr));
-    EXPECT_NE(pdf2md::hash_bitmap(nullptr), pdf2md::hash_bitmap(valid_bmp.get()));
+    const pdf2md::BitmapView null_bmp{};
+    EXPECT_NE(pdf2md::hash_bitmap(null_bmp), pdf2md::hash_bitmap(valid_bmp.view()));
 }
 
 struct FormatWriteCase {
     const char* name;
-    int format;
+    pdf2md::PixelFormat format;
     int bytes_per_pixel;
     uint8_t expected_png_color_type;
 };
@@ -191,10 +219,10 @@ constexpr uint8_t kPngColorRgb = 2U;
 constexpr uint8_t kPngColorRgba = 6U;
 
 constexpr FormatWriteCase kFormatCases[] = {
-    {"gray_8bit", FPDFBitmap_Gray, 1, kPngColorGray},
-    {"bgr_24bit", FPDFBitmap_BGR, 3, kPngColorRgb},
-    {"bgrx_32bit_opaque_rgb", FPDFBitmap_BGRx, 4, kPngColorRgb},
-    {"bgra_32bit_rgba", FPDFBitmap_BGRA, 4, kPngColorRgba},
+    {"gray_8bit", pdf2md::PixelFormat::Gray, 1, kPngColorGray},
+    {"bgr_24bit", pdf2md::PixelFormat::BGR, 3, kPngColorRgb},
+    {"bgrx_32bit_opaque_rgb", pdf2md::PixelFormat::BGRx, 4, kPngColorRgb},
+    {"bgra_32bit_rgba", pdf2md::PixelFormat::BGRA, 4, kPngColorRgba},
 };
 
 constexpr std::size_t kExpectedFormatCaseCount = 4;
@@ -208,11 +236,11 @@ TEST(ImageExtractor, WritesValidPngAcrossBitmapFormatsAndUnicodePaths) {
     ASSERT_EQ(std::size(kFormatCases), kExpectedFormatCaseCount);
     for (const auto& tc : kFormatCases) {
         SCOPED_TRACE(tc.name);
-        ScopedBitmap bmp = make_bitmap(kWidth, kHeight, tc.format);
-        ASSERT_NE(bmp, nullptr);
+        pdf2md::RasterImage bmp = make_bitmap(kWidth, kHeight, tc.format);
+        ASSERT_FALSE(bmp.empty());
 
-        auto* buf = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bmp.get()));
-        const int stride = FPDFBitmap_GetStride(bmp.get());
+        uint8_t* buf = bmp.pixels.data();
+        const int stride = bmp.stride;
         for (int y = 0; y < kHeight; ++y) {
             for (int x = 0; x < kWidth * tc.bytes_per_pixel; ++x) {
                 buf[y * stride + x] = static_cast<uint8_t>((y * 31 + x * 17) & 0xFF);
@@ -223,7 +251,7 @@ TEST(ImageExtractor, WritesValidPngAcrossBitmapFormatsAndUnicodePaths) {
         file_name += tc.name;
         file_name += ".png";
         const fs::path out_path = tmp.path() / file_name;
-        ASSERT_TRUE(pdf2md::write_bitmap_png(bmp.get(), out_path));
+        ASSERT_TRUE(pdf2md::write_bitmap_png(bmp.view(), out_path));
 
         const std::optional<PngHeaderInfo> png = parse_png_wire_file(out_path);
         ASSERT_TRUE(png.has_value());
@@ -237,66 +265,70 @@ TEST(ImageExtractor, WritesValidPngAcrossBitmapFormatsAndUnicodePaths) {
 TEST(ImageExtractor, HashBitmapIsSensitiveToSingleBitFlipAndInvariantToRowStride) {
     constexpr int kWidth = 5;
     constexpr int kHeight = 3;
-    constexpr int kChannels = 3;
-    constexpr int kActiveRowBytes = kWidth * kChannels;
-    constexpr int kTightStride = 16;
-    constexpr int kWideStride = 32;
+    constexpr int kWideStride = 40;
 
-    // Tight buffer padded with 0x00 vs wide buffer padded with 0xA5 garbage bytes.
-    std::vector<uint8_t> tight_buf(static_cast<std::size_t>(kTightStride * kHeight), 0x00U);
-    std::vector<uint8_t> wide_buf(static_cast<std::size_t>(kWideStride * kHeight), 0xA5U);
+    ASSERT_EQ(std::size(kFormatCases), kExpectedFormatCaseCount);
+    for (const auto& fc : kFormatCases) {
+        SCOPED_TRACE(fc.name);
+        const int active_row_bytes = kWidth * fc.bytes_per_pixel;
+        const int tight_stride = active_row_bytes;
 
-    for (int y = 0; y < kHeight; ++y) {
-        for (int b = 0; b < kActiveRowBytes; ++b) {
-            const auto val = static_cast<uint8_t>((y * 53 + b * 29 + 0x7FU) & 0xFFU);
-            tight_buf[static_cast<std::size_t>(y * kTightStride + b)] = val;
-            wide_buf[static_cast<std::size_t>(y * kWideStride + b)] = val;
+        std::vector<uint8_t> tight_buf(static_cast<std::size_t>(tight_stride * kHeight), 0x00U);
+        std::vector<uint8_t> wide_buf(static_cast<std::size_t>(kWideStride * kHeight), 0xA5U);
+
+        for (int y = 0; y < kHeight; ++y) {
+            for (int b = 0; b < active_row_bytes; ++b) {
+                const auto val = static_cast<uint8_t>((y * 53 + b * 29 + 0x7FU) & 0xFFU);
+                tight_buf[static_cast<std::size_t>(y * tight_stride + b)] = val;
+                wide_buf[static_cast<std::size_t>(y * kWideStride + b)] = val;
+            }
         }
+
+        const pdf2md::BitmapView tight_bmp{tight_buf.data(), kWidth, kHeight, tight_stride,
+                                           fc.format};
+        const pdf2md::BitmapView wide_bmp{wide_buf.data(), kWidth, kHeight, kWideStride,
+                                          fc.format};
+
+        const uint64_t baseline_hash = pdf2md::hash_bitmap(tight_bmp);
+        EXPECT_EQ(baseline_hash, pdf2md::hash_bitmap(wide_bmp));
+
+        // 1-bit flip at first active byte (0, 0).
+        tight_buf[0] ^= 0x01U;
+        EXPECT_NE(pdf2md::hash_bitmap(tight_bmp), baseline_hash);
+        tight_buf[0] ^= 0x01U;
+        EXPECT_EQ(pdf2md::hash_bitmap(tight_bmp), baseline_hash);
+
+        // 1-bit flip at last active color byte of last row (catches off-by-one loop bounds;
+        // for BGRx the 4th byte of each pixel is unused padding X, so flip the R channel).
+        const int last_color_offset =
+            (fc.format == pdf2md::PixelFormat::BGRx) ? (active_row_bytes - 2)
+                                                     : (active_row_bytes - 1);
+        const std::size_t last_active =
+            static_cast<std::size_t>((kHeight - 1) * tight_stride + last_color_offset);
+        tight_buf[last_active] ^= 0x01U;
+        EXPECT_NE(pdf2md::hash_bitmap(tight_bmp), baseline_hash);
+        tight_buf[last_active] ^= 0x01U;
+
+        // Sign-bit byte seam: 0x7F vs 0x80 vs 0xFF in first pixel channel.
+        tight_buf[0] = 0x7FU;
+        const uint64_t h_7f = pdf2md::hash_bitmap(tight_bmp);
+        tight_buf[0] = 0x80U;
+        const uint64_t h_80 = pdf2md::hash_bitmap(tight_bmp);
+        tight_buf[0] = 0xFFU;
+        const uint64_t h_ff = pdf2md::hash_bitmap(tight_bmp);
+        EXPECT_NE(h_7f, h_80);
+        EXPECT_NE(h_80, h_ff);
+        EXPECT_NE(h_7f, h_ff);
     }
 
-    ScopedBitmap tight_bmp =
-        make_bitmap(kWidth, kHeight, FPDFBitmap_BGR, tight_buf.data(), kTightStride);
-    ScopedBitmap wide_bmp =
-        make_bitmap(kWidth, kHeight, FPDFBitmap_BGR, wide_buf.data(), kWideStride);
-    ASSERT_NE(tight_bmp, nullptr);
-    ASSERT_NE(wide_bmp, nullptr);
-
-    const uint64_t baseline_hash = pdf2md::hash_bitmap(tight_bmp.get());
-    EXPECT_EQ(baseline_hash, pdf2md::hash_bitmap(wide_bmp.get()));
-
-    // 1-bit flip at very first byte (0, 0).
-    tight_buf[0] ^= 0x01U;
-    const uint64_t first_bit_hash = pdf2md::hash_bitmap(tight_bmp.get());
-    EXPECT_NE(first_bit_hash, baseline_hash);
-    tight_buf[0] ^= 0x01U;
-    EXPECT_EQ(pdf2md::hash_bitmap(tight_bmp.get()), baseline_hash);
-
-    // 1-bit flip at very last active byte of last row (catches off-by-one loop bounds).
-    const std::size_t last_active =
-        static_cast<std::size_t>((kHeight - 1) * kTightStride + (kActiveRowBytes - 1));
-    tight_buf[last_active] ^= 0x01U;
-    EXPECT_NE(pdf2md::hash_bitmap(tight_bmp.get()), baseline_hash);
-    tight_buf[last_active] ^= 0x01U;
-
-    // Sign-bit byte seam: 0x7F vs 0x80 vs 0xFF in interior pixel byte.
-    tight_buf[1] = 0x7FU;
-    const uint64_t h_7f = pdf2md::hash_bitmap(tight_bmp.get());
-    tight_buf[1] = 0x80U;
-    const uint64_t h_80 = pdf2md::hash_bitmap(tight_bmp.get());
-    tight_buf[1] = 0xFFU;
-    const uint64_t h_ff = pdf2md::hash_bitmap(tight_bmp.get());
-    EXPECT_NE(h_7f, h_80);
-    EXPECT_NE(h_80, h_ff);
-    EXPECT_NE(h_7f, h_ff);
-
     // Transposed dimensions with identical pixel count must not collide during deduplication.
-    ScopedBitmap horiz_bmp = make_bitmap(4, 2, FPDFBitmap_BGRA);
-    ScopedBitmap vert_bmp = make_bitmap(2, 4, FPDFBitmap_BGRA);
-    ASSERT_NE(horiz_bmp, nullptr);
-    ASSERT_NE(vert_bmp, nullptr);
-    fill_bgra_rect(horiz_bmp.get(), 0, 0, 4, 2, 0x00U, 0x00U, 0x00U);
-    fill_bgra_rect(vert_bmp.get(), 0, 0, 2, 4, 0x00U, 0x00U, 0x00U);
-    EXPECT_NE(pdf2md::hash_bitmap(horiz_bmp.get()), pdf2md::hash_bitmap(vert_bmp.get()));
+    pdf2md::RasterImage horiz_bmp = make_bitmap(4, 2, pdf2md::PixelFormat::BGRA);
+    pdf2md::RasterImage vert_bmp = make_bitmap(2, 4, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(horiz_bmp.empty());
+    ASSERT_FALSE(vert_bmp.empty());
+    fill_bgra_rect(horiz_bmp, 0, 0, 4, 2, 0x00U, 0x00U, 0x00U);
+    fill_bgra_rect(vert_bmp, 0, 0, 2, 4, 0x00U, 0x00U, 0x00U);
+    EXPECT_NE(pdf2md::hash_bitmap(horiz_bmp.view()), pdf2md::hash_bitmap(vert_bmp.view()));
 }
 
 struct InkFractionCase {
@@ -318,44 +350,58 @@ static_assert(std::size(kInkCases) == kExpectedInkCaseCount);
 TEST(ImageExtractor, ComputesBitmapInkFractionAcrossToneAndStrideSeams) {
     constexpr int kWidth = 10;
     constexpr int kHeight = 4;
-    constexpr int kPaddedGrayStride = 16;
+    constexpr int kPaddedStride = 48;
 
     ASSERT_EQ(std::size(kInkCases), kExpectedInkCaseCount);
     for (const auto& tc : kInkCases) {
         SCOPED_TRACE(tc.name);
 
-        // Initialize entire buffer (including stride padding bytes 10..15) to 0x00 (black):
-        // if bitmap_ink_fraction accidentally reads padding bytes, 0.0 and 0.25 will fail.
-        std::vector<uint8_t> gray_buf(static_cast<std::size_t>(kPaddedGrayStride * kHeight),
-                                      0x00U);
-        int remaining_dark = tc.dark_pixels;
-        for (int y = 0; y < kHeight; ++y) {
-            for (int x = 0; x < kWidth; ++x) {
-                const uint8_t tone = (remaining_dark > 0) ? 0x00U : 0xFFU;
-                if (remaining_dark > 0) {
-                    --remaining_dark;
+        ASSERT_EQ(std::size(kFormatCases), kExpectedFormatCaseCount);
+        for (const auto& fc : kFormatCases) {
+            SCOPED_TRACE(fc.name);
+            // Fill entire padded buffer with 0x00 so reading stride padding or BGRx's
+            // unused X byte (set to 0x00 on white pixels) fails immediately.
+            std::vector<uint8_t> buf(static_cast<std::size_t>(kPaddedStride * kHeight), 0x00U);
+            int remaining_dark = tc.dark_pixels;
+            for (int y = 0; y < kHeight; ++y) {
+                for (int x = 0; x < kWidth; ++x) {
+                    const bool is_dark = remaining_dark > 0;
+                    if (is_dark) {
+                        --remaining_dark;
+                    }
+                    const uint8_t tone = is_dark ? 0x10U : 0xFFU;
+                    uint8_t* px = buf.data() +
+                                  static_cast<std::ptrdiff_t>(y * kPaddedStride +
+                                                              x * fc.bytes_per_pixel);
+                    if (fc.format == pdf2md::PixelFormat::Gray) {
+                        px[0] = tone;
+                    } else if (fc.format == pdf2md::PixelFormat::BGR) {
+                        px[0] = tone;
+                        px[1] = tone;
+                        px[2] = tone;
+                    } else if (fc.format == pdf2md::PixelFormat::BGRx) {
+                        px[0] = tone;
+                        px[1] = tone;
+                        px[2] = tone;
+                        px[3] = 0x00U;  // Unused X channel must not darken white BGRx pixels.
+                    } else {
+                        px[0] = tone;
+                        px[1] = tone;
+                        px[2] = tone;
+                        px[3] = 0xFFU;
+                    }
                 }
-                gray_buf[static_cast<std::size_t>(y * kPaddedGrayStride + x)] = tone;
             }
+            const pdf2md::BitmapView view{buf.data(), kWidth, kHeight, kPaddedStride, fc.format};
+            EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(view), tc.expected_fraction);
         }
-
-        ScopedBitmap gray_bmp = make_bitmap(kWidth, kHeight, FPDFBitmap_Gray, gray_buf.data(),
-                                            kPaddedGrayStride);
-        ASSERT_NE(gray_bmp, nullptr);
-        EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(gray_bmp.get()), tc.expected_fraction);
-
-        // Verify matching fraction on 4-channel BGRA bitmap.
-        ScopedBitmap bgra_bmp = make_bitmap(kWidth, kHeight, FPDFBitmap_BGRA);
-        ASSERT_NE(bgra_bmp, nullptr);
-        fill_bgra_rect(bgra_bmp.get(), 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
-        int bgra_dark = tc.dark_pixels;
-        for (int y = 0; y < kHeight && bgra_dark > 0; ++y) {
-            for (int x = 0; x < kWidth && bgra_dark > 0; ++x, --bgra_dark) {
-                fill_bgra_rect(bgra_bmp.get(), x, y, 1, 1, 0x10U, 0x10U, 0x10U);
-            }
-        }
-        EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(bgra_bmp.get()), tc.expected_fraction);
     }
+
+    // Sign-bit tone check (0x7F and 0x80 both count as dark ink, while 0xFF is blank paper).
+    const std::array<uint8_t, 3> sign_seam_row = {0x7FU, 0x80U, 0xFFU};
+    const pdf2md::BitmapView sign_seam_bmp{sign_seam_row.data(), 3, 1, 3,
+                                           pdf2md::PixelFormat::Gray};
+    EXPECT_DOUBLE_EQ(pdf2md::bitmap_ink_fraction(sign_seam_bmp), 2.0 / 3.0);
 }
 
 TEST(ImageExtractor, ScanBandRejectsBlankOrUnderThresholdWithoutWritingFiles) {
@@ -364,34 +410,61 @@ TEST(ImageExtractor, ScanBandRejectsBlankOrUnderThresholdWithoutWritingFiles) {
     constexpr int kHeight = 80;
 
     // Pure white scan band returns false without creating an output file.
-    ScopedBitmap blank_bmp = make_bitmap(kWidth, kHeight, FPDFBitmap_BGRA);
-    ASSERT_NE(blank_bmp, nullptr);
-    fill_bgra_rect(blank_bmp.get(), 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
+    pdf2md::RasterImage blank_bmp = make_bitmap(kWidth, kHeight, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(blank_bmp.empty());
+    fill_bgra_rect(blank_bmp, 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
 
     const fs::path blank_out = tmp.path() / "blank.png";
-    EXPECT_FALSE(pdf2md::write_scan_band_png(blank_bmp.get(), blank_out, 4, 0.01));
+    EXPECT_FALSE(pdf2md::write_scan_band_png(blank_bmp.view(), blank_out, 4, 0.01));
     EXPECT_FALSE(fs::exists(blank_out));
 
-    // Sparse 2-pixel dust corners below min_ink_fraction return false without creating a file.
-    ScopedBitmap sparse_bmp = make_bitmap(kWidth, kHeight, FPDFBitmap_BGRA);
-    ASSERT_NE(sparse_bmp, nullptr);
-    fill_bgra_rect(sparse_bmp.get(), 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
-    fill_bgra_rect(sparse_bmp.get(), 10, 10, 1, 1, 0x00U, 0x00U, 0x00U);
-    fill_bgra_rect(sparse_bmp.get(), 90, 70, 1, 1, 0x00U, 0x00U, 0x00U);
-
-    const fs::path sparse_out = tmp.path() / "sparse.png";
-    EXPECT_FALSE(pdf2md::write_scan_band_png(sparse_bmp.get(), sparse_out, 2, 0.05));
-    EXPECT_FALSE(fs::exists(sparse_out));
-
     // Top-edge text bleed strip with blank paper below trims to empty and writes nothing.
-    ScopedBitmap bleed_only_bmp = make_bitmap(kWidth, kHeight, FPDFBitmap_BGRA);
-    ASSERT_NE(bleed_only_bmp, nullptr);
-    fill_bgra_rect(bleed_only_bmp.get(), 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
-    fill_bgra_rect(bleed_only_bmp.get(), 15, 0, 60, 4, 0x00U, 0x00U, 0x00U);
+    pdf2md::RasterImage bleed_only_bmp = make_bitmap(kWidth, kHeight, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(bleed_only_bmp.empty());
+    fill_bgra_rect(bleed_only_bmp, 0, 0, kWidth, kHeight, 0xFFU, 0xFFU, 0xFFU);
+    fill_bgra_rect(bleed_only_bmp, 15, 0, 60, 4, 0x00U, 0x00U, 0x00U);
 
     const fs::path bleed_only_out = tmp.path() / "bleed_only.png";
-    EXPECT_FALSE(pdf2md::write_scan_band_png(bleed_only_bmp.get(), bleed_only_out, 2, 0.01));
+    EXPECT_FALSE(pdf2md::write_scan_band_png(bleed_only_bmp.view(), bleed_only_out, 2, 0.01));
     EXPECT_FALSE(fs::exists(bleed_only_out));
+
+    // Exact min_ink_fraction seam (B - 1, B, B + 1 dark pixels) on a 50x40 (2000 px) figure
+    // with continuous left/right borders (zero white gaps, cropped bbox == full 50x40 canvas)
+    // against min_ink_fraction = 0.125 (exact binary float 250 / 2000).
+    struct ThresholdSeamCase {
+        const char* name;
+        int total_dark_pixels;
+        bool expected_written;
+    };
+    constexpr ThresholdSeamCase kSeamCases[] = {
+        {"below_min_ink_fraction_b_minus_1", 249, false},
+        {"exact_min_ink_fraction_seam_b", 250, true},
+        {"above_min_ink_fraction_b_plus_1", 251, true},
+    };
+    constexpr std::size_t kExpectedSeamCount = 3;
+    ASSERT_EQ(std::size(kSeamCases), kExpectedSeamCount);
+
+    constexpr int kSeamW = 50;
+    constexpr int kSeamH = 40;
+    constexpr int kLeftBarW = 6;  // 6 * 40 = 240 px: uniform 12% density on every row, zero gaps.
+    constexpr int kLeftBarPixels = kLeftBarW * kSeamH;
+    constexpr double kThreshold = 0.125;
+
+    for (const auto& tc : kSeamCases) {
+        SCOPED_TRACE(tc.name);
+        pdf2md::RasterImage seam_bmp = make_bitmap(kSeamW, kSeamH, pdf2md::PixelFormat::BGRA);
+        ASSERT_FALSE(seam_bmp.empty());
+        fill_bgra_rect(seam_bmp, 0, 0, kSeamW, kSeamH, 0xFFU, 0xFFU, 0xFFU);
+
+        fill_bgra_rect(seam_bmp, 0, 0, kLeftBarW, kSeamH, 0x00U, 0x00U, 0x00U);
+        const int right_edge_pixels = tc.total_dark_pixels - kLeftBarPixels;
+        fill_bgra_rect(seam_bmp, kSeamW - 1, 10, 1, right_edge_pixels, 0x00U, 0x00U, 0x00U);
+
+        const fs::path seam_out = tmp.path() / (std::string(tc.name) + ".png");
+        EXPECT_EQ(pdf2md::write_scan_band_png(seam_bmp.view(), seam_out, 0, kThreshold),
+                  tc.expected_written);
+        EXPECT_EQ(fs::exists(seam_out), tc.expected_written);
+    }
 }
 
 TEST(ImageExtractor, ScanBandTrimsEdgeBleedAndCropsToInkBoundingBoxPlusPadding) {
@@ -403,17 +476,17 @@ TEST(ImageExtractor, ScanBandTrimsEdgeBleedAndCropsToInkBoundingBoxPlusPadding) 
     constexpr int kFigW = 50;
     constexpr int kFigH = 40;
 
-    ScopedBitmap band_bmp = make_bitmap(kCanvasW, kCanvasH, FPDFBitmap_BGRA);
-    ASSERT_NE(band_bmp, nullptr);
-    fill_bgra_rect(band_bmp.get(), 0, 0, kCanvasW, kCanvasH, 0xFFU, 0xFFU, 0xFFU);
+    pdf2md::RasterImage band_bmp = make_bitmap(kCanvasW, kCanvasH, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(band_bmp.empty());
+    fill_bgra_rect(band_bmp, 0, 0, kCanvasW, kCanvasH, 0xFFU, 0xFFU, 0xFFU);
 
     // Neighbouring text-line bleed hugging top (rows 0..3) and bottom (rows 116..119),
     // separated from the central figure by wide white gaps.
-    fill_bgra_rect(band_bmp.get(), 5, 0, 100, 4, 0x00U, 0x00U, 0x00U);
-    fill_bgra_rect(band_bmp.get(), 5, 116, 100, 4, 0x00U, 0x00U, 0x00U);
+    fill_bgra_rect(band_bmp, 5, 0, 100, 4, 0x00U, 0x00U, 0x00U);
+    fill_bgra_rect(band_bmp, 5, 116, 100, 4, 0x00U, 0x00U, 0x00U);
 
     // Central dark figure at [30..80) x [35..75) -> exact 50x40 ink bbox.
-    fill_bgra_rect(band_bmp.get(), kFigX, kFigY, kFigW, kFigH, 0x00U, 0x00U, 0x00U);
+    fill_bgra_rect(band_bmp, kFigX, kFigY, kFigW, kFigH, 0x00U, 0x00U, 0x00U);
 
     struct CropPadCase {
         const char* name;
@@ -432,7 +505,7 @@ TEST(ImageExtractor, ScanBandTrimsEdgeBleedAndCropsToInkBoundingBoxPlusPadding) 
     for (const auto& tc : kPadCases) {
         SCOPED_TRACE(tc.name);
         const fs::path out_path = tmp.path() / (std::string(tc.name) + ".png");
-        ASSERT_TRUE(pdf2md::write_scan_band_png(band_bmp.get(), out_path, tc.pad, 0.01));
+        ASSERT_TRUE(pdf2md::write_scan_band_png(band_bmp.view(), out_path, tc.pad, 0.01));
 
         const std::optional<PngHeaderInfo> png = parse_png_wire_file(out_path);
         ASSERT_TRUE(png.has_value());
@@ -442,13 +515,13 @@ TEST(ImageExtractor, ScanBandTrimsEdgeBleedAndCropsToInkBoundingBoxPlusPadding) 
     }
 
     // Oversized padding on a clean figure canvas clamps to exact [0..width) x [0..height) bounds.
-    ScopedBitmap clean_bmp = make_bitmap(kCanvasW, kCanvasH, FPDFBitmap_BGRA);
-    ASSERT_NE(clean_bmp, nullptr);
-    fill_bgra_rect(clean_bmp.get(), 0, 0, kCanvasW, kCanvasH, 0xFFU, 0xFFU, 0xFFU);
-    fill_bgra_rect(clean_bmp.get(), kFigX, kFigY, kFigW, kFigH, 0x00U, 0x00U, 0x00U);
+    pdf2md::RasterImage clean_bmp = make_bitmap(kCanvasW, kCanvasH, pdf2md::PixelFormat::BGRA);
+    ASSERT_FALSE(clean_bmp.empty());
+    fill_bgra_rect(clean_bmp, 0, 0, kCanvasW, kCanvasH, 0xFFU, 0xFFU, 0xFFU);
+    fill_bgra_rect(clean_bmp, kFigX, kFigY, kFigW, kFigH, 0x00U, 0x00U, 0x00U);
 
     const fs::path clamped_out = tmp.path() / "oversized_pad_clamped.png";
-    ASSERT_TRUE(pdf2md::write_scan_band_png(clean_bmp.get(), clamped_out, 200, 0.01));
+    ASSERT_TRUE(pdf2md::write_scan_band_png(clean_bmp.view(), clamped_out, 200, 0.01));
     const std::optional<PngHeaderInfo> clamped_png = parse_png_wire_file(clamped_out);
     ASSERT_TRUE(clamped_png.has_value());
     EXPECT_EQ(clamped_png->width, static_cast<uint32_t>(kCanvasW));

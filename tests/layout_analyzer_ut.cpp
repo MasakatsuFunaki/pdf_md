@@ -1,6 +1,6 @@
-#include "layout_analyzer.h"
+#include "pdf2md/layout_analyzer.h"
 
-#include "document_model.h"
+#include "pdf2md/document_model.h"
 
 #include <gtest/gtest.h>
 
@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2126,6 +2127,755 @@ TEST(LayoutRuledGrid, CrossPageContinuationStitchesWhileRepeatedHeadersStaySepar
                        {{U"Term", U"Kind", U"Note"}, {U"alpha", U"one", U"first"}});
     expect_table_cells(separate.blocks[1],
                        {{U"Term", U"Kind", U"Note"}, {U"beta", U"two", U"second"}});
+}
+
+TEST(LayoutLinks, ResolvesCharLinkIdsAcrossRunsTablesAndPages) {
+    // 1. Inline prose link resolves 1-based CharInfo::link_id into StyledRun::link_url
+    // without pulling URL slashes or hyphens into inline math mode.
+    std::vector<FreeGlyph> p0_gs;
+    double x = put_tight(p0_gs, "Read", kLeftMargin, 700.0);
+    p0_gs.push_back({U' ', x, 700.0});
+    x += 4.0;
+    const std::size_t link_start = p0_gs.size();
+    x = put_tight(p0_gs, "https://p0.example.org/a-b", x, 700.0);
+    const std::size_t link_end = p0_gs.size();
+
+    pdf2md::PageData p0 = make_free_page(p0_gs);
+    p0.links.push_back({90.0, 698.0, 260.0, 712.0, "https://p0.example.org/a-b"});
+    for (std::size_t i = link_start; i < link_end; ++i) {
+        p0.chars[i].link_id = 1U;
+    }
+
+    // 2. Page 1 has its own independent PageData::links[0] inside a table cell.
+    std::vector<FreeGlyph> p1_gs;
+    put_token(p1_gs, "Field", 72.0, 700.0);
+    put_token(p1_gs, "Link", 200.0, 700.0);
+    put_token(p1_gs, "Spec", 72.0, 684.0);
+    const std::size_t cell_link_start = p1_gs.size();
+    put_token(p1_gs, "Portal", 200.0, 684.0);
+    const std::size_t cell_link_end = p1_gs.size();
+    put_token(p1_gs, "Other", 72.0, 668.0);
+    put_token(p1_gs, "Plain", 200.0, 668.0);
+
+    pdf2md::PageData p1 = make_free_page(p1_gs);
+    p1.links.push_back({198.0, 682.0, 245.0, 696.0, "https://p1.example.org/portal"});
+    for (std::size_t i = cell_link_start; i < cell_link_end; ++i) {
+        p1.chars[i].link_id = 1U;
+    }
+
+    const pdf2md::Document doc = analyze_pages({p0, p1});
+    ASSERT_EQ(doc.blocks.size(), 2u);
+
+    ASSERT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[0].lines.size(), 1u);
+    ASSERT_EQ(doc.blocks[0].lines[0].runs.size(), 2u);
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[0].text, U"Read ");
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[0].link_url, "");
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[1].text, U"https://p0.example.org/a-b");
+    EXPECT_FALSE(doc.blocks[0].lines[0].runs[1].math);
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[1].link_url, "https://p0.example.org/a-b");
+
+    ASSERT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::Table);
+    ASSERT_EQ(doc.blocks[1].table_cells.size(), 3u);
+    ASSERT_EQ(doc.blocks[1].table_cells[1].size(), 2u);
+    ASSERT_EQ(doc.blocks[1].table_cells[1][1].size(), 1u);
+    EXPECT_EQ(doc.blocks[1].table_cells[1][1][0].text, U"Portal");
+    EXPECT_EQ(doc.blocks[1].table_cells[1][1][0].link_url, "https://p1.example.org/portal");
+    ASSERT_EQ(doc.blocks[1].table_cells[2][1].size(), 1u);
+    EXPECT_EQ(doc.blocks[1].table_cells[2][1][0].link_url, "");
+}
+
+TEST(LayoutStrikethrough, MidlineHorizontalRuleAndCharFlagProduceStrikethroughRuns) {
+    // 1. Thin horizontal rule through the glyph x-height midline marks covered glyphs
+    // strikethrough and is consumed (never emitted as a thematic HorizontalRule block).
+    std::vector<FreeGlyph> gs;
+    double x = put_tight(gs, "keep", kLeftMargin, 700.0);
+    gs.push_back({U' ', x, 700.0});
+    x += 4.0;
+    const double strike_x0 = x;
+    x = put_tight(gs, "obsolete", x, 700.0);
+    const double strike_x1 = x;
+    gs.push_back({U' ', x, 700.0});
+    x += 4.0;
+    const double under_x0 = x;
+    x = put_tight(gs, "underlined", x, 700.0);
+    const double under_x1 = x;
+
+    pdf2md::PageData page = make_free_page(gs);
+    page.rules.push_back({strike_x0, 704.0, strike_x1, 704.0, true, 1.0});
+    page.rules.push_back({under_x0, 699.5, under_x1, 699.5, true, 1.0});
+
+    const pdf2md::Document doc = analyze_page(page);
+    ASSERT_EQ(doc.blocks.size(), 1u);
+    ASSERT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[0].lines.size(), 1u);
+    ASSERT_EQ(doc.blocks[0].lines[0].runs.size(), 3u);
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[0].text, U"keep ");
+    EXPECT_FALSE(doc.blocks[0].lines[0].runs[0].strikethrough);
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[1].text, U"obsolete ");
+    EXPECT_TRUE(doc.blocks[0].lines[0].runs[1].strikethrough);
+    EXPECT_EQ(doc.blocks[0].lines[0].runs[2].text, U"underlined");
+    EXPECT_FALSE(doc.blocks[0].lines[0].runs[2].strikethrough);
+
+    // 2. Explicit CharInfo::strikethrough flag (annotation path) propagates to StyledRun.
+    pdf2md::PageData annot_page = make_free_page({
+        {U'o', 72.0, 700.0},
+        {U'l', 78.0, 700.0},
+        {U'd', 84.0, 700.0},
+    });
+    ASSERT_EQ(annot_page.chars.size(), 3u);
+    for (std::size_t i = 0; i < 3u; ++i) {
+        annot_page.chars[i].strikethrough = true;
+    }
+    const pdf2md::Document annot_doc = analyze_page(annot_page);
+    ASSERT_EQ(annot_doc.blocks.size(), 1u);
+    ASSERT_EQ(annot_doc.blocks[0].lines.size(), 1u);
+    ASSERT_EQ(annot_doc.blocks[0].lines[0].runs.size(), 1u);
+    EXPECT_EQ(annot_doc.blocks[0].lines[0].runs[0].text, U"old");
+    EXPECT_TRUE(annot_doc.blocks[0].lines[0].runs[0].strikethrough);
+}
+
+TEST(LayoutHorizontalRule, PromotesStandaloneVectorAndDashDividersWhileSkippingTableRules) {
+    // 1. Standalone wide horizontal vector rule between paragraphs -> HorizontalRule block.
+    {
+        std::vector<FreeGlyph> gs;
+        put_token(gs, "Lead paragraph text before section break.", 72.0, 700.0);
+        put_token(gs, "Trailing paragraph text after section break.", 72.0, 600.0);
+        pdf2md::PageData page = make_free_page(gs);
+        page.rules.push_back({72.0, 650.0, 520.0, 650.0, true, 1.0});
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 3u);
+        EXPECT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+        EXPECT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::HorizontalRule);
+        EXPECT_EQ(doc.blocks[2].kind, pdf2md::BlockKind::Paragraph);
+    }
+
+    // 2. Standalone "---" text divider line -> HorizontalRule block.
+    {
+        std::vector<FreeGlyph> gs;
+        put_token(gs, "First section prose line.", 72.0, 700.0);
+        put_token(gs, "---", 72.0, 650.0);
+        put_token(gs, "Second section prose line.", 72.0, 600.0);
+
+        const pdf2md::Document doc = analyze_page(make_free_page(gs));
+        ASSERT_EQ(doc.blocks.size(), 3u);
+        EXPECT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+        EXPECT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::HorizontalRule);
+        EXPECT_EQ(doc.blocks[2].kind, pdf2md::BlockKind::Paragraph);
+    }
+
+    // 3. Booktabs horizontal rules bordering a text-geometry table do NOT emit HorizontalRule.
+    {
+        std::vector<FreeGlyph> gs;
+        put_token(gs, "Model", 72.0, 700.0, kBodySize, true);
+        put_token(gs, "BLEU", 220.0, 700.0, kBodySize, true);
+        put_token(gs, "Cost", 340.0, 700.0, kBodySize, true);
+        put_token(gs, "Base", 72.0, 684.0);
+        put_token(gs, "27.3", 220.0, 684.0);
+        put_token(gs, "100", 340.0, 684.0);
+        put_token(gs, "Big", 72.0, 668.0);
+        put_token(gs, "28.4", 220.0, 668.0);
+        put_token(gs, "300", 340.0, 668.0);
+
+        pdf2md::PageData page = make_free_page(gs);
+        hrule(page, 713.0, 70.0, 420.0);
+        hrule(page, 696.0, 70.0, 420.0);
+        hrule(page, 664.0, 70.0, 420.0);
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 1u);
+        EXPECT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Table);
+    }
+}
+
+TEST(LayoutMath, ReconstructsRuleAnchoredFractionsVinculumRadicalsAndNthRoots) {
+    // 1. Leading display fraction anchored by horizontal fraction-bar RuleSegment
+    // with full-size numerator and denominator glyphs: \frac{a+b}{c+d} = y.
+    {
+        std::vector<FreeGlyph> gs;
+        for (int i = 0; i < 20; ++i) {
+            gs.push_back({static_cast<char32_t>(U'a' + (i % 26)),
+                          kLeftMargin + static_cast<double>(i) * 6.0, 750.0});
+        }
+        // Numerator "a+b" above bar at y = 702.5, denominator "c+d" below bar.
+        gs.push_back({U'a', 250.0, 707.0, 10.0, true});
+        gs.push_back({U'+', 258.0, 707.0, 10.0});
+        gs.push_back({U'b', 266.0, 707.0, 10.0, true});
+        gs.push_back({U'c', 250.0, 690.0, 10.0, true});
+        gs.push_back({U'+', 258.0, 690.0, 10.0});
+        gs.push_back({U'd', 266.0, 690.0, 10.0, true});
+        // Axis host "= y" to the right of the fraction bar.
+        gs.push_back({U'=', 280.0, 700.0, 10.0});
+        gs.push_back({U'y', 292.0, 700.0, 10.0, true});
+
+        pdf2md::PageData page = make_free_page(gs);
+        page.rules.push_back({248.0, 702.5, 273.0, 702.5, true, 0.5});
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 2u);
+        EXPECT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::MathDisplay);
+        ASSERT_EQ(doc.blocks[1].math_lines.size(), 1u);
+        EXPECT_EQ(doc.blocks[1].math_lines[0], U"\\frac{a+b}{c+d} = y");
+    }
+
+    // 2. Vinculum overbar RuleSegment captures multi-atom radicand \sqrt{2\pi}.
+    {
+        pdf2md::PageData page = make_free_page({
+            {U'l', 72.0, 700.0},
+            {U'e', 78.0, 700.0},
+            {U't', 84.0, 700.0},
+            {U' ', 90.0, 700.0},
+            {0x221A, 96.0, 704.0, 12.0, false, false, true},
+            {U'2', 103.0, 700.0, 10.0},
+            {0x03C0, 110.0, 700.0, 10.0, true},
+        });
+        page.rules.push_back({102.0, 710.0, 118.0, 710.0, true, 0.5});
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 1u);
+        ASSERT_EQ(doc.blocks[0].lines.size(), 1u);
+        expect_runs(doc.blocks[0].lines[0].runs,
+                    {plain_run(U"let "), math_run(U"\\sqrt{2\\pi}")});
+    }
+
+    // 3. Hook index before U+221A with vinculum produces Nth-root \sqrt[3]{x}.
+    {
+        pdf2md::PageData page = make_free_page({
+            {U'l', 72.0, 700.0},
+            {U'e', 78.0, 700.0},
+            {U't', 84.0, 700.0},
+            {U' ', 90.0, 700.0},
+            {U'3', 98.0, 705.0, 6.0},
+            {0x221A, 101.0, 704.0, 12.0, false, false, true},
+            {U'x', 108.0, 700.0, 10.0, true},
+        });
+        page.rules.push_back({107.0, 710.0, 115.0, 710.0, true, 0.5});
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 1u);
+        ASSERT_EQ(doc.blocks[0].lines.size(), 1u);
+        expect_runs(doc.blocks[0].lines[0].runs,
+                    {plain_run(U"let "), math_run(U"\\sqrt[3]{x}")});
+    }
+}
+
+TEST(LayoutMath, UnwrapsAuthorAffiliationSuperscriptsFromMathMode) {
+    // 1. Bold author surname carrying symbolic affiliation superscript stays plain bold prose,
+    // never wrapped into \mathbf{Vaswani}^\dagger math mode.
+    const pdf2md::Document author_doc = analyze_page(make_math_line(
+        {
+            {up(U'A'), up(U's'), up(U'h'), up(U'i'), up(U's'), up(U'h')},
+            {{U'V', 0, false, true},
+             {U'a', 0, false, true},
+             {U's', 0, false, true},
+             {U'w', 0, false, true},
+             {U'a', 0, false, true},
+             {U'n', 0, false, true},
+             {U'i', 0, false, true},
+             up(0x2020, 1)},
+        },
+        700.0));
+    ASSERT_EQ(author_doc.blocks.size(), 1u);
+    ASSERT_EQ(author_doc.blocks[0].lines.size(), 1u);
+    EXPECT_EQ(author_doc.blocks[0].lines[0].plain, U"Ashish Vaswani\u2020");
+    ASSERT_EQ(author_doc.blocks[0].lines[0].runs.size(), 3u);
+    EXPECT_EQ(author_doc.blocks[0].lines[0].runs[0].text, U"Ashish ");
+    EXPECT_FALSE(author_doc.blocks[0].lines[0].runs[0].math);
+    EXPECT_EQ(author_doc.blocks[0].lines[0].runs[1].text, U"Vaswani");
+    EXPECT_TRUE(author_doc.blocks[0].lines[0].runs[1].bold);
+    EXPECT_FALSE(author_doc.blocks[0].lines[0].runs[1].math);
+    EXPECT_EQ(author_doc.blocks[0].lines[0].runs[2].text, U"\u2020");
+    EXPECT_FALSE(author_doc.blocks[0].lines[0].runs[2].math);
+
+    // 2. Bold prose word carrying numeric superscript unwraps to bold run + raw [^1] ref.
+    const pdf2md::Document bold_fn_doc = analyze_page(make_math_line(
+        {
+            {up(U's'), up(U'e'), up(U'e')},
+            {{U'S', 0, false, true},
+             {U'm', 0, false, true},
+             {U'i', 0, false, true},
+             {U't', 0, false, true},
+             {U'h', 0, false, true},
+             up(U'1', 1)},
+        },
+        700.0));
+    ASSERT_EQ(bold_fn_doc.blocks.size(), 1u);
+    ASSERT_EQ(bold_fn_doc.blocks[0].lines.size(), 1u);
+    expect_runs(bold_fn_doc.blocks[0].lines[0].runs,
+                {plain_run(U"see "), bold_run(U"Smith"), raw_run(U"[^1]")});
+}
+
+TEST(LayoutBlocks, DetectsUnicodeBallotAndBracketTaskListItems) {
+    std::vector<FreeGlyph> gs;
+    gs.push_back({0x2610, 72.0, 720.0});
+    put_token(gs, "Unchecked task", 84.0, 720.0);
+
+    gs.push_back({0x2611, 72.0, 704.0});
+    put_token(gs, "Checked task", 84.0, 704.0);
+
+    gs.push_back({0x2612, 96.0, 688.0});
+    put_token(gs, "Nested checked task", 108.0, 688.0);
+
+    const pdf2md::Document doc = analyze_page(make_free_page(gs));
+    ASSERT_EQ(doc.blocks.size(), 3u);
+
+    EXPECT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::ListItem);
+    EXPECT_EQ(doc.blocks[0].task_state, pdf2md::TaskState::Unchecked);
+    EXPECT_FALSE(doc.blocks[0].list_ordered);
+    EXPECT_EQ(doc.blocks[0].list_indent, 0);
+    expect_block_lines(doc.blocks[0], pdf2md::BlockKind::ListItem, {U"Unchecked task"});
+
+    EXPECT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::ListItem);
+    EXPECT_EQ(doc.blocks[1].task_state, pdf2md::TaskState::Checked);
+    EXPECT_FALSE(doc.blocks[1].list_ordered);
+    EXPECT_EQ(doc.blocks[1].list_indent, 0);
+    expect_block_lines(doc.blocks[1], pdf2md::BlockKind::ListItem, {U"Checked task"});
+
+    EXPECT_EQ(doc.blocks[2].kind, pdf2md::BlockKind::ListItem);
+    EXPECT_EQ(doc.blocks[2].task_state, pdf2md::TaskState::Checked);
+    EXPECT_FALSE(doc.blocks[2].list_ordered);
+    EXPECT_EQ(doc.blocks[2].list_indent, 1);
+    expect_block_lines(doc.blocks[2], pdf2md::BlockKind::ListItem, {U"Nested checked task"});
+}
+
+TEST(LayoutTable, InfersColumnAlignmentOnTextAndRuledTables) {
+    auto token_width = [](std::string_view s) {
+        return static_cast<double>(s.size() - 1U) * (kBodySize * kGlyphAdvanceRatio) +
+               kBodySize * kGlyphWidthRatio;
+    };
+    auto put_centered = [&](std::vector<FreeGlyph>& gs, std::string_view s, double x_center,
+                            double y, bool bold = false) {
+        put_token(gs, s, x_center - 0.5 * token_width(s), y, kBodySize, bold);
+    };
+    auto put_right = [&](std::vector<FreeGlyph>& gs, std::string_view s, double x_right, double y,
+                         bool bold = false) {
+        put_token(gs, s, x_right - token_width(s), y, kBodySize, bold);
+    };
+
+    // 1. Text-geometry table: left column -> None, centered column -> Center, numeric -> Right.
+    {
+        std::vector<FreeGlyph> gs;
+        put_token(gs, "Item", 72.0, 700.0, kBodySize, true);
+        put_centered(gs, "Status", 240.0, 700.0, true);
+        put_right(gs, "Amount", 400.0, 700.0, true);
+
+        put_token(gs, "a", 72.0, 684.0);
+        put_centered(gs, "ok", 240.0, 684.0);
+        put_right(gs, "9", 400.0, 684.0);
+
+        put_token(gs, "medium", 72.0, 668.0);
+        put_centered(gs, "pending", 240.0, 668.0);
+        put_right(gs, "420", 400.0, 668.0);
+
+        put_token(gs, "verylongname", 72.0, 652.0);
+        put_centered(gs, "validated", 240.0, 652.0);
+        put_right(gs, "128,500", 400.0, 652.0);
+
+        const pdf2md::Document doc = analyze_page(make_free_page(gs));
+        ASSERT_EQ(doc.blocks.size(), 1u);
+        ASSERT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Table);
+        ASSERT_EQ(doc.blocks[0].table_align.size(), 3u);
+        EXPECT_EQ(doc.blocks[0].table_align[0], pdf2md::TableAlign::None);
+        EXPECT_EQ(doc.blocks[0].table_align[1], pdf2md::TableAlign::Center);
+        EXPECT_EQ(doc.blocks[0].table_align[2], pdf2md::TableAlign::Right);
+    }
+
+    // 2. Ruled-lattice table with borders {70, 190, 330, 470}.
+    {
+        std::vector<FreeGlyph> gs;
+        put_token(gs, "Name", 76.0, 706.0, kBodySize, true);
+        put_centered(gs, "State", 260.0, 706.0, true);
+        put_right(gs, "Total", 464.0, 706.0, true);
+
+        put_token(gs, "alpha", 76.0, 684.0);
+        put_centered(gs, "ok", 260.0, 684.0);
+        put_right(gs, "12", 464.0, 684.0);
+
+        put_token(gs, "beta_item", 76.0, 662.0);
+        put_centered(gs, "running", 260.0, 662.0);
+        put_right(gs, "98,400", 464.0, 662.0);
+
+        pdf2md::PageData page = make_free_page(gs);
+        draw_grid(page, {70.0, 190.0, 330.0, 470.0}, {720.0, 698.0, 676.0, 654.0});
+
+        const pdf2md::Document doc = analyze_page(page);
+        ASSERT_EQ(doc.blocks.size(), 1u);
+        ASSERT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Table);
+        ASSERT_EQ(doc.blocks[0].table_align.size(), 3u);
+        EXPECT_EQ(doc.blocks[0].table_align[0], pdf2md::TableAlign::None);
+        EXPECT_EQ(doc.blocks[0].table_align[1], pdf2md::TableAlign::Center);
+        EXPECT_EQ(doc.blocks[0].table_align[2], pdf2md::TableAlign::Right);
+    }
+}
+
+TEST(LayoutHeadings, PromotesOutlineMatchedBlocksAndIsolatedNumberedBoldTitles) {
+    // 1. DocMeta::outlines promotes matching unbolded body-size paragraphs to Heading.
+    {
+        std::vector<FreeGlyph> gs;
+        put_body(gs, 8, 760.0);
+        put_token(gs, "Overview", 72.0, 600.0, kBodySize, false);
+        put_body(gs, 3, 575.0);
+        put_token(gs, "Architecture", 72.0, 515.0, kBodySize, false);
+        put_token(gs, "Data Flow", 72.0, 480.0, kBodySize, false);
+
+        const pdf2md::PageData page = make_free_page(gs);
+        pdf2md::DocMeta meta;
+        meta.page_count = 1;
+        meta.outlines = {
+            {"Overview", 1, 0, 610.0, true},
+            {"Architecture", 1, 0, 525.0, true},
+            {"Data Flow", 2, 0, 490.0, true},
+        };
+
+        const pdf2md::Document promoted =
+            pdf2md::analyze_layout(meta, {page}, {.detect_headings = true});
+        ASSERT_EQ(promoted.blocks.size(), 5u);
+        expect_block_lines(promoted.blocks[1], pdf2md::BlockKind::Heading, {U"Overview"});
+        EXPECT_EQ(promoted.blocks[1].heading_level, 1);
+        expect_block_lines(promoted.blocks[3], pdf2md::BlockKind::Heading, {U"Architecture"});
+        EXPECT_EQ(promoted.blocks[3].heading_level, 1);
+        expect_block_lines(promoted.blocks[4], pdf2md::BlockKind::Heading, {U"Data Flow"});
+        EXPECT_EQ(promoted.blocks[4].heading_level, 2);
+
+        const pdf2md::Document suppressed =
+            pdf2md::analyze_layout(meta, {page}, {.detect_headings = false});
+        ASSERT_EQ(suppressed.blocks.size(), 5u);
+        EXPECT_EQ(suppressed.blocks[1].kind, pdf2md::BlockKind::Paragraph);
+        EXPECT_EQ(suppressed.blocks[3].kind, pdf2md::BlockKind::Paragraph);
+        EXPECT_EQ(suppressed.blocks[4].kind, pdf2md::BlockKind::Paragraph);
+    }
+
+    // 2. Isolated bold "1. Introduction" / "2. Architecture" promote to Heading with number
+    // restored, whereas adjacent sibling bold ordered list items stay ListItems.
+    {
+        std::vector<FreeGlyph> gs;
+        put_body(gs, 8, 760.0);
+        put_token(gs, "1. Introduction", 72.0, 620.0, 12.0, true);
+        put_body(gs, 4, 590.0);
+        put_token(gs, "2. Architecture", 72.0, 510.0, 12.0, true);
+        put_body(gs, 4, 480.0);
+        put_token(gs, "1. First step", 72.0, 400.0, kBodySize, true);
+        put_token(gs, "2. Second step", 72.0, 384.0, kBodySize, true);
+
+        const pdf2md::Document doc = analyze_page(make_free_page(gs));
+        ASSERT_EQ(doc.blocks.size(), 7u);
+        expect_block_lines(doc.blocks[1], pdf2md::BlockKind::Heading, {U"1. Introduction"});
+        expect_block_lines(doc.blocks[3], pdf2md::BlockKind::Heading, {U"2. Architecture"});
+        expect_block_lines(doc.blocks[5], pdf2md::BlockKind::ListItem, {U"First step"});
+        EXPECT_TRUE(doc.blocks[5].list_ordered);
+        expect_block_lines(doc.blocks[6], pdf2md::BlockKind::ListItem, {U"Second step"});
+        EXPECT_TRUE(doc.blocks[6].list_ordered);
+    }
+}
+
+TEST(LayoutImages, PlacesTwoColumnFiguresInMatchingColumnAndPairsCaptionAltText) {
+    // 1. Right-column figure stays inside the right column (after all left-column prose,
+    // including a left-column paragraph with y_top = 498 < image y_bottom = 540) and pairs
+    // with its adjacent "Figure 2: ..." caption to populate Block::image_alt.
+    std::vector<FreeGlyph> gs;
+    for (int i = 0; i < 6; ++i) {
+        const double top_y = 740.0 - static_cast<double>(i) * 12.0;
+        const double mid_y = 656.0 - static_cast<double>(i) * 12.0;
+        const double low_y = 572.0 - static_cast<double>(i) * 12.0;
+        const double right_bot_y = 480.0 - static_cast<double>(i) * 12.0;
+        put_tight(gs, (i == 5) ? "LeftTopParagraphEnds." : "LeftTopColumnProseLine", 72.0, top_y);
+        put_tight(gs, (i == 5) ? "LeftMidParagraphEnds." : "LeftMidColumnProseLine", 72.0, mid_y);
+        put_tight(gs, (i == 5) ? "LeftLowParagraphEnds." : "LeftLowColumnProseLine", 72.0, low_y);
+        put_tight(gs, (i == 5) ? "RightTopParagraphEnds." : "RightTopColumnProseLine", 330.0,
+                  top_y);
+        put_tight(gs, (i == 5) ? "RightBottomParagraphEnds." : "RightBottomColumnProse", 330.0,
+                  right_bot_y);
+    }
+    for (int j = 0; j < 5; ++j) {
+        const double left_bot_y = 488.0 - static_cast<double>(j) * 12.0;
+        put_tight(gs, (j == 4) ? "LeftBottomParagraphEnds." : "LeftBottomColumnProse", 72.0,
+                  left_bot_y);
+    }
+    put_token(gs, "Figure 2: Trace tree overview.", 330.0, 520.0);
+
+    pdf2md::PageData two_col_page = make_free_page(gs);
+    two_col_page.images.push_back({"images/right_fig.png", 330.0, 660.0, 540.0, 530.0, ""});
+
+    const pdf2md::Document doc = analyze_page(two_col_page);
+    ASSERT_EQ(doc.blocks.size(), 8u);
+    EXPECT_EQ(doc.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[0].lines.size(), 6u);
+    EXPECT_EQ(doc.blocks[0].lines[5].plain, U"LeftTopParagraphEnds.");
+
+    EXPECT_EQ(doc.blocks[1].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[1].lines.size(), 6u);
+    EXPECT_EQ(doc.blocks[1].lines[5].plain, U"LeftMidParagraphEnds.");
+
+    EXPECT_EQ(doc.blocks[2].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[2].lines.size(), 6u);
+    EXPECT_EQ(doc.blocks[2].lines[5].plain, U"LeftLowParagraphEnds.");
+
+    EXPECT_EQ(doc.blocks[3].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[3].lines.size(), 5u);
+    EXPECT_EQ(doc.blocks[3].lines[4].plain, U"LeftBottomParagraphEnds.");
+
+    EXPECT_EQ(doc.blocks[4].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[4].lines.size(), 6u);
+    EXPECT_EQ(doc.blocks[4].lines[5].plain, U"RightTopParagraphEnds.");
+
+    EXPECT_EQ(doc.blocks[5].kind, pdf2md::BlockKind::Image);
+    EXPECT_EQ(doc.blocks[5].image_path, "images/right_fig.png");
+    EXPECT_EQ(doc.blocks[5].image_alt, "Figure 2: Trace tree overview.");
+
+    expect_block_lines(doc.blocks[6], pdf2md::BlockKind::Paragraph,
+                       {U"Figure 2: Trace tree overview."});
+
+    EXPECT_EQ(doc.blocks[7].kind, pdf2md::BlockKind::Paragraph);
+    ASSERT_EQ(doc.blocks[7].lines.size(), 6u);
+    EXPECT_EQ(doc.blocks[7].lines[5].plain, U"RightBottomParagraphEnds.");
+
+    // 2. Tagged PDF ImageRef::alt takes precedence over adjacent caption text.
+    std::vector<FreeGlyph> tagged_gs;
+    put_token(tagged_gs, "Figure 1: Visible caption below.", 72.0, 470.0);
+    pdf2md::PageData tagged_page = make_free_page(tagged_gs);
+    tagged_page.images.push_back(
+        {"images/tagged.png", 72.0, 680.0, 490.0, 400.0, "Tagged architecture diagram"});
+
+    const pdf2md::Document tagged_doc = analyze_page(tagged_page);
+    ASSERT_EQ(tagged_doc.blocks.size(), 2u);
+    EXPECT_EQ(tagged_doc.blocks[0].kind, pdf2md::BlockKind::Image);
+    EXPECT_EQ(tagged_doc.blocks[0].image_alt, "Tagged architecture diagram");
+    expect_block_lines(tagged_doc.blocks[1], pdf2md::BlockKind::Paragraph,
+                       {U"Figure 1: Visible caption below."});
+}
+
+static_assert(std::is_copy_constructible_v<pdf2md::LayoutAnalyzer>);
+static_assert(std::is_copy_assignable_v<pdf2md::LayoutAnalyzer>);
+static_assert(std::is_nothrow_move_constructible_v<pdf2md::LayoutAnalyzer> &&
+              std::is_nothrow_move_assignable_v<pdf2md::LayoutAnalyzer>);
+
+void expect_styled_runs_identical(const std::vector<pdf2md::StyledRun>& actual,
+                                  const std::vector<pdf2md::StyledRun>& expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(actual[i].text, expected[i].text);
+        EXPECT_EQ(actual[i].bold, expected[i].bold);
+        EXPECT_EQ(actual[i].italic, expected[i].italic);
+        EXPECT_EQ(actual[i].mono, expected[i].mono);
+        EXPECT_EQ(actual[i].math, expected[i].math);
+        EXPECT_EQ(actual[i].raw, expected[i].raw);
+        EXPECT_EQ(actual[i].strikethrough, expected[i].strikethrough);
+        EXPECT_EQ(actual[i].link_id, expected[i].link_id);
+        EXPECT_EQ(actual[i].link_url, expected[i].link_url);
+    }
+}
+
+void expect_documents_equal(const pdf2md::Document& actual, const pdf2md::Document& expected) {
+    EXPECT_EQ(actual.meta.title, expected.meta.title);
+    EXPECT_EQ(actual.meta.author, expected.meta.author);
+    EXPECT_EQ(actual.meta.page_count, expected.meta.page_count);
+    EXPECT_EQ(actual.meta.subject, expected.meta.subject);
+    EXPECT_EQ(actual.meta.keywords, expected.meta.keywords);
+    ASSERT_EQ(actual.meta.outlines.size(), expected.meta.outlines.size());
+    for (std::size_t i = 0; i < expected.meta.outlines.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(actual.meta.outlines[i].title, expected.meta.outlines[i].title);
+        EXPECT_EQ(actual.meta.outlines[i].level, expected.meta.outlines[i].level);
+        EXPECT_EQ(actual.meta.outlines[i].page, expected.meta.outlines[i].page);
+        EXPECT_DOUBLE_EQ(actual.meta.outlines[i].y, expected.meta.outlines[i].y);
+        EXPECT_EQ(actual.meta.outlines[i].has_y, expected.meta.outlines[i].has_y);
+    }
+
+    EXPECT_DOUBLE_EQ(actual.body_size, expected.body_size);
+    ASSERT_EQ(actual.blocks.size(), expected.blocks.size());
+    for (std::size_t b = 0; b < expected.blocks.size(); ++b) {
+        SCOPED_TRACE(b);
+        const pdf2md::Block& ab = actual.blocks[b];
+        const pdf2md::Block& eb = expected.blocks[b];
+        EXPECT_EQ(ab.kind, eb.kind);
+        EXPECT_EQ(ab.page, eb.page);
+        EXPECT_DOUBLE_EQ(ab.x0, eb.x0);
+        EXPECT_DOUBLE_EQ(ab.x1, eb.x1);
+        EXPECT_DOUBLE_EQ(ab.y_top, eb.y_top);
+        EXPECT_DOUBLE_EQ(ab.y_bottom, eb.y_bottom);
+        EXPECT_DOUBLE_EQ(ab.size, eb.size);
+        EXPECT_EQ(ab.bold_majority, eb.bold_majority);
+        EXPECT_EQ(ab.heading_level, eb.heading_level);
+        EXPECT_EQ(ab.list_indent, eb.list_indent);
+        EXPECT_EQ(ab.list_ordered, eb.list_ordered);
+        EXPECT_EQ(ab.blockquote, eb.blockquote);
+        EXPECT_EQ(ab.is_footnote, eb.is_footnote);
+        EXPECT_EQ(ab.footnote_numbered, eb.footnote_numbered);
+        EXPECT_EQ(ab.footnote_label, eb.footnote_label);
+        EXPECT_EQ(ab.list_marker, eb.list_marker);
+        EXPECT_EQ(ab.col_edges, eb.col_edges);
+        EXPECT_EQ(ab.image_path, eb.image_path);
+        EXPECT_EQ(ab.math_lines, eb.math_lines);
+        EXPECT_EQ(ab.math_tag, eb.math_tag);
+        EXPECT_EQ(ab.table_align, eb.table_align);
+        EXPECT_EQ(ab.image_alt, eb.image_alt);
+        EXPECT_EQ(ab.task_state, eb.task_state);
+
+        ASSERT_EQ(ab.lines.size(), eb.lines.size());
+        for (std::size_t l = 0; l < eb.lines.size(); ++l) {
+            SCOPED_TRACE(l);
+            EXPECT_EQ(ab.lines[l].plain, eb.lines[l].plain);
+            expect_styled_runs_identical(ab.lines[l].runs, eb.lines[l].runs);
+        }
+
+        ASSERT_EQ(ab.table_cells.size(), eb.table_cells.size());
+        for (std::size_t r = 0; r < eb.table_cells.size(); ++r) {
+            SCOPED_TRACE(r);
+            ASSERT_EQ(ab.table_cells[r].size(), eb.table_cells[r].size());
+            for (std::size_t c = 0; c < eb.table_cells[r].size(); ++c) {
+                SCOPED_TRACE(c);
+                expect_styled_runs_identical(ab.table_cells[r][c], eb.table_cells[r][c]);
+            }
+        }
+    }
+}
+
+TEST(LayoutBlocks, PimplAnalyzerSupportsCopyMoveAndReusablePassPipeline) {
+    constexpr int kBodyLineCount = 6;
+    constexpr int kPageZero = 0;
+    constexpr int kPageOne = 1;
+    constexpr int kTwoPageCount = 2;
+    constexpr int kHeadingLevel1 = 1;
+    constexpr int kHeadingLevel2 = 2;
+    constexpr double kBodyTopY = 760.0;
+    constexpr double kMajorHeadingY = 620.0;
+    constexpr double kSubHeadingY = 580.0;
+    constexpr double kMajorHeadingSize = 15.0;
+    constexpr double kSubHeadingSize = 12.0;
+    constexpr double kFootnoteLabelY = 123.6;
+    constexpr double kFootnoteBodyY = 120.0;
+    constexpr double kFootnoteLabelSize = 6.0;
+    constexpr double kFootnoteTextX = 79.0;
+    constexpr double kFootnoteSecondWordX = 122.0;
+    constexpr double kTextTableCol0X = 72.0;
+    constexpr double kTextTableCol1X = 150.0;
+    constexpr double kTextTableCol2X = 210.0;
+    constexpr double kTextTableRow0Y = 700.0;
+    constexpr double kTextTableRow1Y = 684.0;
+    constexpr double kTextTableRow2Y = 668.0;
+    constexpr std::size_t kExpectedDoc1Blocks = 4U;
+    constexpr std::size_t kExpectedDoc2Blocks = 5U;
+
+    // Multi-page input #1: outline + numbered heading, numbered footnote on page 0
+    // (floated to document end), and a ruled-lattice table on page 1.
+    pdf2md::DocMeta meta1;
+    meta1.title = "Pipeline Spec One";
+    meta1.author = "Author One";
+    meta1.page_count = kTwoPageCount;
+    meta1.outlines = {{"1 Overview", kHeadingLevel1, kPageZero, kMajorHeadingY + kBodySize, true}};
+
+    std::vector<FreeGlyph> doc1_p0_gs;
+    put_body(doc1_p0_gs, kBodyLineCount, kBodyTopY);
+    put_token(doc1_p0_gs, "1 Overview", kLeftMargin, kMajorHeadingY, kMajorHeadingSize, true);
+    doc1_p0_gs.push_back({U'1', kLeftMargin, kFootnoteLabelY, kFootnoteLabelSize});
+    put_token(doc1_p0_gs, "alpha", kFootnoteTextX, kFootnoteBodyY);
+    put_token(doc1_p0_gs, "note", kFootnoteSecondWordX, kFootnoteBodyY);
+
+    std::vector<pdf2md::PageData> pages1 = {
+        make_free_page(doc1_p0_gs),
+        ruled_table_page({{"Metric", "Unit", "Target"}, {"Latency", "ms", "15"}}, true),
+    };
+    pages1[0].index = kPageZero;
+    pages1[1].index = kPageOne;
+
+    // Multi-page input #2: nested headings, in-flow symbol footnote on page 0 (no outlines,
+    // no numbered footnotes), and a text-geometry table on page 1 (empty col_edges).
+    pdf2md::DocMeta meta2;
+    meta2.title = "Pipeline Spec Two";
+    meta2.author = "Author Two";
+    meta2.page_count = kTwoPageCount;
+
+    std::vector<FreeGlyph> doc2_p0_gs;
+    put_body(doc2_p0_gs, kBodyLineCount, kBodyTopY);
+    put_token(doc2_p0_gs, "2 Architecture", kLeftMargin, kMajorHeadingY, kMajorHeadingSize, true);
+    put_token(doc2_p0_gs, "2.1 Passes", kLeftMargin, kSubHeadingY, kSubHeadingSize, true);
+    doc2_p0_gs.push_back({0x2020, kLeftMargin, kFootnoteLabelY, kFootnoteLabelSize});
+    put_token(doc2_p0_gs, "dagger", kFootnoteTextX, kFootnoteBodyY);
+    put_token(doc2_p0_gs, "remark", kFootnoteSecondWordX, kFootnoteBodyY);
+
+    std::vector<FreeGlyph> doc2_p1_gs;
+    put_token(doc2_p1_gs, "Name", kTextTableCol0X, kTextTableRow0Y);
+    put_token(doc2_p1_gs, "Lo", kTextTableCol1X, kTextTableRow0Y);
+    put_token(doc2_p1_gs, "Hi", kTextTableCol2X, kTextTableRow0Y);
+    put_token(doc2_p1_gs, "aa", kTextTableCol0X, kTextTableRow1Y);
+    put_token(doc2_p1_gs, "10", kTextTableCol1X, kTextTableRow1Y);
+    put_token(doc2_p1_gs, "20", kTextTableCol2X, kTextTableRow1Y);
+    put_token(doc2_p1_gs, "bb", kTextTableCol0X, kTextTableRow2Y);
+    put_token(doc2_p1_gs, "11", kTextTableCol1X, kTextTableRow2Y);
+    put_token(doc2_p1_gs, "21", kTextTableCol2X, kTextTableRow2Y);
+
+    std::vector<pdf2md::PageData> pages2 = {
+        make_free_page(doc2_p0_gs),
+        make_free_page(doc2_p1_gs),
+    };
+    pages2[0].index = kPageZero;
+    pages2[1].index = kPageOne;
+
+    const pdf2md::LayoutAnalyzer analyzer(pdf2md::AnalyzeParams{});
+
+    const pdf2md::Document doc1 = analyzer.analyze(meta1, pages1);
+    ASSERT_EQ(doc1.blocks.size(), kExpectedDoc1Blocks);
+    EXPECT_EQ(doc1.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+    expect_block_lines(doc1.blocks[1], pdf2md::BlockKind::Heading, {U"1 Overview"});
+    EXPECT_EQ(doc1.blocks[1].heading_level, kHeadingLevel1);
+    expect_table_cells(doc1.blocks[2], {{U"Metric", U"Unit", U"Target"}, {U"Latency", U"ms", U"15"}});
+    EXPECT_FALSE(doc1.blocks[2].col_edges.empty());
+    EXPECT_TRUE(doc1.blocks[3].is_footnote);
+    EXPECT_TRUE(doc1.blocks[3].footnote_numbered);
+    EXPECT_EQ(doc1.blocks[3].footnote_label, U"1");
+    expect_block_lines(doc1.blocks[3], pdf2md::BlockKind::Paragraph, {U"alpha note"});
+    expect_documents_equal(doc1, pdf2md::analyze_layout(meta1, pages1));
+
+    const pdf2md::Document doc2 = analyzer.analyze(meta2, pages2);
+    ASSERT_EQ(doc2.blocks.size(), kExpectedDoc2Blocks);
+    EXPECT_EQ(doc2.blocks[0].kind, pdf2md::BlockKind::Paragraph);
+    expect_block_lines(doc2.blocks[1], pdf2md::BlockKind::Heading, {U"2 Architecture"});
+    EXPECT_EQ(doc2.blocks[1].heading_level, kHeadingLevel1);
+    expect_block_lines(doc2.blocks[2], pdf2md::BlockKind::Heading, {U"2.1 Passes"});
+    EXPECT_EQ(doc2.blocks[2].heading_level, kHeadingLevel2);
+    EXPECT_TRUE(doc2.blocks[3].is_footnote);
+    EXPECT_FALSE(doc2.blocks[3].footnote_numbered);
+    EXPECT_EQ(doc2.blocks[3].footnote_label, U"\u2020");
+    expect_block_lines(doc2.blocks[3], pdf2md::BlockKind::Paragraph, {U"dagger remark"});
+    expect_table_cells(doc2.blocks[4],
+                       {{U"Name", U"Lo", U"Hi"}, {U"aa", U"10", U"20"}, {U"bb", U"11", U"21"}});
+    EXPECT_TRUE(doc2.blocks[4].col_edges.empty());
+    expect_documents_equal(doc2, pdf2md::analyze_layout(meta2, pages2));
+
+    // Re-running input #1 on the same const LayoutAnalyzer produces identical output.
+    expect_documents_equal(analyzer.analyze(meta1, pages1), doc1);
+
+    // Copy construction, copy assignment (rebuilding cached pipeline options), and self-copy.
+    const pdf2md::AnalyzeParams flat_params{
+        .detect_headings = false, .detect_tables = false, .strip_headers_footers = false};
+    pdf2md::LayoutAnalyzer mutable_analyzer(flat_params);
+    const pdf2md::Document flat_doc1 = mutable_analyzer.analyze(meta1, pages1);
+    expect_documents_equal(flat_doc1, pdf2md::analyze_layout(meta1, pages1, flat_params));
+    ASSERT_EQ(flat_doc1.blocks.size(), kExpectedDoc1Blocks);
+    EXPECT_EQ(flat_doc1.blocks[1].kind, pdf2md::BlockKind::Paragraph);
+    EXPECT_EQ(flat_doc1.blocks[2].kind, pdf2md::BlockKind::Paragraph);
+
+    const pdf2md::LayoutAnalyzer copied_analyzer(analyzer);
+    expect_documents_equal(copied_analyzer.analyze(meta2, pages2), doc2);
+
+    mutable_analyzer = copied_analyzer;
+    const pdf2md::LayoutAnalyzer& self_alias = mutable_analyzer;
+    mutable_analyzer = self_alias;
+    expect_documents_equal(mutable_analyzer.analyze(meta1, pages1), doc1);
+    expect_documents_equal(mutable_analyzer.analyze(meta2, pages2), doc2);
+
+    // Move construction, move assignment, and reassignment of a moved-from instance.
+    pdf2md::LayoutAnalyzer move_constructed(std::move(mutable_analyzer));
+    expect_documents_equal(move_constructed.analyze(meta2, pages2), doc2);
+
+    pdf2md::LayoutAnalyzer move_assigned(flat_params);
+    move_assigned = std::move(move_constructed);
+    expect_documents_equal(move_assigned.analyze(meta1, pages1), doc1);
+
+    mutable_analyzer = pdf2md::LayoutAnalyzer(flat_params);
+    expect_documents_equal(mutable_analyzer.analyze(meta1, pages1), flat_doc1);
 }
 
 }  // namespace

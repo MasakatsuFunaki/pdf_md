@@ -1,8 +1,9 @@
-#include "markdown_writer.h"
+#include "pdf2md/markdown_writer.h"
 
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -15,7 +16,9 @@ using pdf2md::BlockKind;
 using pdf2md::Document;
 using pdf2md::Line;
 using pdf2md::StyledRun;
+using pdf2md::TableAlign;
 using pdf2md::TableCell;
+using pdf2md::TaskState;
 using pdf2md::WriteOptions;
 
 constexpr double kDefaultFontSize = 11.0;
@@ -314,9 +317,41 @@ TEST(MarkdownWriter, RendersTightOrderedUnorderedAndNestedLists) {
         "Intro\n\n"
         "- one\n"
         "    - 1\\. Introduction\n"
-        "        - deep child\n"
+        "        - deep child\n\n"
         "2. second\n\n"
         "Outro\n";
+    EXPECT_EQ(pdf2md::write_markdown(doc, WriteOptions{}), expected);
+}
+
+TEST(MarkdownWriter, RendersTaskListsNestingAndTopLevelListKindTransitions) {
+    auto make_item = [](const char32_t* marker, bool ordered, int indent, const char32_t* text,
+                        TaskState task = TaskState::None) {
+        Block b;
+        b.kind = BlockKind::ListItem;
+        b.size = kDefaultFontSize;
+        b.list_marker = marker;
+        b.list_ordered = ordered;
+        b.list_indent = indent;
+        b.task_state = task;
+        b.lines.push_back(make_line({StyledRun{text}}));
+        return b;
+    };
+
+    Document doc;
+    doc.blocks.push_back(make_item(U"-", false, 0, U"Write [unit] tests", TaskState::Unchecked));
+    doc.blocks.push_back(make_item(U"-", false, 0, U"Verify release", TaskState::Checked));
+    doc.blocks.push_back(make_item(U"-", false, 1, U"Nested task", TaskState::Checked));
+    doc.blocks.push_back(make_item(U"-", false, 0, U"Final bullet"));
+    doc.blocks.push_back(make_item(U"1.", true, 0, U"First ordered"));
+    doc.blocks.push_back(make_item(U"2.", true, 0, U"Second ordered"));
+
+    const std::string expected =
+        "- [ ] Write \\[unit] tests\n"
+        "- [x] Verify release\n"
+        "    - [x] Nested task\n"
+        "- Final bullet\n\n"
+        "1. First ordered\n"
+        "2. Second ordered\n";
     EXPECT_EQ(pdf2md::write_markdown(doc, WriteOptions{}), expected);
 }
 
@@ -545,6 +580,407 @@ TEST(MarkdownWriter, EmitsFrontMatterAndPageBreaksFromWriteOptions) {
         "---\n\n"
         "Page two body\n";
     EXPECT_EQ(pdf2md::write_markdown(doc, opts), expected);
+}
+
+StyledRun make_link_run(const char32_t* text, std::string url, bool bold = false) {
+    StyledRun r;
+    r.text = text;
+    r.bold = bold;
+    r.link_url = std::move(url);
+    return r;
+}
+
+StyledRun make_strike_run(const char32_t* text, bool bold = false, bool italic = false) {
+    StyledRun r;
+    r.text = text;
+    r.bold = bold;
+    r.italic = italic;
+    r.strikethrough = true;
+    return r;
+}
+
+TEST(MarkdownWriter, FormatsHyperlinksLinkEscapingAndBareProseUrls) {
+    struct LinkInlineCase {
+        const char* name;
+        std::vector<StyledRun> runs;
+        bool enable_links;
+        const char* expected_md;
+    };
+
+    const std::vector<LinkInlineCase> cases = {
+        {"basic_link_hugs_text_and_pushes_spaces_outside",
+         {StyledRun{U"See"}, make_link_run(U" Specification ", "https://example.org/spec"),
+          StyledRun{U"now"}},
+         true,
+         "See [Specification](https://example.org/spec) now\n"},
+        {"closing_bracket_escaped_inside_link_label",
+         {make_link_run(U"RFC [2119]", "https://example.org/rfc2119")},
+         true,
+         "[RFC \\[2119\\]](https://example.org/rfc2119)\n"},
+        {"destination_with_space_wrapped_in_angle_brackets",
+         {make_link_run(U"Manual", "https://example.org/user guide.pdf")},
+         true,
+         "[Manual](<https://example.org/user guide.pdf>)\n"},
+        {"destination_with_unbalanced_paren_wrapped_in_angle_brackets",
+         {make_link_run(U"C++ Reference", "https://en.wikipedia.org/wiki/C++)")},
+         true,
+         "[C++ Reference](<https://en.wikipedia.org/wiki/C++)>)\n"},
+        {"links_disabled_option_suppresses_link_syntax",
+         {StyledRun{U"Read "}, make_link_run(U"Specification", "https://example.org/spec")},
+         false,
+         "Read Specification\n"},
+        {"url_shaped_link_label_escapes_tildes_and_underscores_inside_brackets",
+         {make_link_run(U"https://example.org/~alice/my_spec.pdf",
+                        "https://example.org/~alice/my_spec.pdf")},
+         true,
+         "[https://example.org/\\~alice/my\\_spec.pdf](https://example.org/~alice/my_spec.pdf)\n"},
+        {"bare_prose_url_preserves_underscores_and_tildes_while_surrounding_text_escapes",
+         {StyledRun{U"visit https://example.org/~alice/my_spec_v2.pdf for var_name ~approx~"}},
+         true,
+         "visit https://example.org/~alice/my_spec_v2.pdf for var\\_name \\~approx\\~\n"},
+    };
+
+    constexpr std::size_t kExpectedLinkCaseCount = 7;
+    ASSERT_EQ(cases.size(), kExpectedLinkCaseCount);
+    for (const auto& tc : cases) {
+        SCOPED_TRACE(tc.name);
+        Document doc;
+        doc.blocks.push_back(make_paragraph(tc.runs));
+        WriteOptions opts;
+        opts.links = tc.enable_links;
+        EXPECT_EQ(pdf2md::write_markdown(doc, opts), tc.expected_md);
+    }
+
+    // Wrapped link runs across lines merge into one hyperlink when sharing the same URL,
+    // while adjacent links with distinct URLs remain separate.
+    Document wrapped_doc;
+    wrapped_doc.blocks.push_back(make_wrapped_paragraph({
+        {make_link_run(U"Developer", "https://example.org/dev-guide")},
+        {make_link_run(U"Guide", "https://example.org/dev-guide"), StyledRun{U" and "},
+         make_link_run(U"API", "https://example.org/api")},
+    }));
+    EXPECT_EQ(pdf2md::write_markdown(wrapped_doc, WriteOptions{}),
+              "[Developer Guide](https://example.org/dev-guide) and "
+              "[API](https://example.org/api)\n");
+
+    // Pipe character inside a table-cell link URL is percent-encoded as %7C.
+    Block table;
+    table.kind = BlockKind::Table;
+    table.table_cells = {
+        {TableCell{StyledRun{U"Resource"}}},
+        {TableCell{make_link_run(U"Spec", "https://example.org/a|b")}},
+    };
+    Document table_doc;
+    table_doc.blocks.push_back(std::move(table));
+    EXPECT_EQ(pdf2md::write_markdown(table_doc, WriteOptions{}),
+              "| Resource |\n"
+              "| --- |\n"
+              "| [Spec](https://example.org/a%7Cb) |\n");
+}
+
+TEST(MarkdownWriter, FormatsInlineStrikethroughAndCombinedEmphasis) {
+    const std::vector<StyledRunCase> cases = {
+        {"plain_strikethrough",
+         {make_strike_run(U"deprecated")},
+         "~~deprecated~~\n"},
+        {"combined_bold_italic_strikethrough",
+         {make_strike_run(U"text", true, true)},
+         "***~~text~~***\n"},
+        {"spaces_kept_outside_strikethrough_delimiters",
+         {StyledRun{U"keep"}, make_strike_run(U" old draft "), StyledRun{U"active"}},
+         "keep ~~old draft~~ active\n"},
+    };
+
+    constexpr std::size_t kExpectedStrikeCaseCount = 3;
+    ASSERT_EQ(cases.size(), kExpectedStrikeCaseCount);
+    for (const auto& tc : cases) {
+        SCOPED_TRACE(tc.name);
+        Document doc;
+        doc.blocks.push_back(make_paragraph(tc.runs));
+        EXPECT_EQ(pdf2md::write_markdown(doc, WriteOptions{}), tc.expected_md);
+    }
+
+    // Wrapped strikethrough runs join seamlessly across line breaks.
+    Document wrapped_strike;
+    wrapped_strike.blocks.push_back(make_wrapped_paragraph({
+        {make_strike_run(U"removed")},
+        {make_strike_run(U"clause")},
+    }));
+    EXPECT_EQ(pdf2md::write_markdown(wrapped_strike, WriteOptions{}), "~~removed clause~~\n");
+}
+
+TEST(MarkdownWriter, RendersHorizontalRulesImageAltTextAndTableColumnAlignments) {
+    Document doc;
+    doc.blocks.push_back(make_paragraph({StyledRun{U"Before divider"}}));
+
+    Block hr;
+    hr.kind = BlockKind::HorizontalRule;
+    doc.blocks.push_back(std::move(hr));
+
+    Block img_with_alt;
+    img_with_alt.kind = BlockKind::Image;
+    img_with_alt.image_path = "img.png";
+    img_with_alt.image_alt = "Figure 1: Architecture [v2]";
+    doc.blocks.push_back(std::move(img_with_alt));
+
+    Block img_empty_alt;
+    img_empty_alt.kind = BlockKind::Image;
+    img_empty_alt.image_path = "img.png";
+    doc.blocks.push_back(std::move(img_empty_alt));
+
+    Block aligned_table;
+    aligned_table.kind = BlockKind::Table;
+    aligned_table.table_align = {
+        TableAlign::None,
+        TableAlign::Left,
+        TableAlign::Center,
+        TableAlign::Right,
+    };
+    aligned_table.table_cells = {
+        {TableCell{StyledRun{U"Default"}}, TableCell{StyledRun{U"Left"}},
+         TableCell{StyledRun{U"Center"}}, TableCell{StyledRun{U"Right"}}},
+        {TableCell{StyledRun{U"a"}}, TableCell{StyledRun{U"b"}},
+         TableCell{StyledRun{U"c"}}, TableCell{StyledRun{U"99"}}},
+    };
+    doc.blocks.push_back(std::move(aligned_table));
+
+    const std::string expected =
+        "Before divider\n\n"
+        "---\n\n"
+        "![Figure 1: Architecture \\[v2\\]](img.png)\n\n"
+        "![](img.png)\n\n"
+        "| Default | Left | Center | Right |\n"
+        "| --- | :--- | :---: | ---: |\n"
+        "| a | b | c | 99 |\n";
+    EXPECT_EQ(pdf2md::write_markdown(doc, WriteOptions{}), expected);
+
+    // Standalone HorizontalRule produces exact "---\n".
+    Document single_hr;
+    Block only_hr;
+    only_hr.kind = BlockKind::HorizontalRule;
+    single_hr.blocks.push_back(std::move(only_hr));
+    EXPECT_EQ(pdf2md::write_markdown(single_hr, WriteOptions{}), "---\n");
+}
+
+TEST(MarkdownWriter, EmitsTableOfContentsAndRichEscapedYamlFrontMatter) {
+    auto make_heading = [](int level, const char32_t* title) {
+        Block h;
+        h.kind = BlockKind::Heading;
+        h.heading_level = level;
+        h.size = kHeadingFontSize;
+        h.lines.push_back(make_line({StyledRun{title}}));
+        return h;
+    };
+
+    Document doc;
+    doc.meta.title = "Spec\x07Title";
+    doc.meta.author = "Ada Lovelace";
+    doc.meta.page_count = 3;
+    doc.meta.subject = "Architecture\x01Overview";
+    doc.meta.keywords = "pdf, markdown";
+    doc.meta.creation_date = "2026-01-15T08:30:00Z";
+    doc.meta.mod_date = "2026-02-20T14:00:00Z";
+
+    doc.blocks.push_back(make_heading(2, U"Overview"));
+    doc.blocks.push_back(make_paragraph({StyledRun{U"Intro text."}}));
+    doc.blocks.push_back(make_heading(3, U"Deep Dive"));
+    doc.blocks.push_back(make_heading(2, U"Summary"));
+    doc.blocks.push_back(make_heading(3, U"Deep Dive"));
+
+    WriteOptions opts;
+    opts.front_matter = true;
+    opts.toc = true;
+    opts.source_name = "manual.pdf";
+
+    const std::string expected =
+        "---\n"
+        "title: \"Spec\\u0007Title\"\n"
+        "author: \"Ada Lovelace\"\n"
+        "subject: \"Architecture\\u0001Overview\"\n"
+        "keywords: [\"pdf\", \"markdown\"]\n"
+        "date: \"2026-01-15T08:30:00Z\"\n"
+        "modified: \"2026-02-20T14:00:00Z\"\n"
+        "source: \"manual.pdf\"\n"
+        "pages: 3\n"
+        "---\n\n"
+        "- [Overview](#overview)\n"
+        "  - [Deep Dive](#deep-dive)\n"
+        "- [Summary](#summary)\n"
+        "  - [Deep Dive](#deep-dive-1)\n\n"
+        "## Overview\n\n"
+        "Intro text.\n\n"
+        "### Deep Dive\n\n"
+        "## Summary\n\n"
+        "### Deep Dive\n";
+    EXPECT_EQ(pdf2md::write_markdown(doc, opts), expected);
+
+    // Identical creation_date and mod_date omits redundant modified field, and heading-free
+    // document with toc = true emits no empty TOC list.
+    Document no_heading_doc;
+    no_heading_doc.meta.creation_date = "2026-01-15";
+    no_heading_doc.meta.mod_date = "2026-01-15";
+    no_heading_doc.meta.page_count = 1;
+    no_heading_doc.blocks.push_back(make_paragraph({StyledRun{U"Body only."}}));
+
+    WriteOptions same_date_opts;
+    same_date_opts.front_matter = true;
+    same_date_opts.toc = true;
+    EXPECT_EQ(pdf2md::write_markdown(no_heading_doc, same_date_opts),
+              "---\n"
+              "date: \"2026-01-15\"\n"
+              "pages: 1\n"
+              "---\n\n"
+              "Body only.\n");
+}
+
+static_assert(std::is_copy_constructible_v<pdf2md::MarkdownWriter>);
+static_assert(std::is_copy_assignable_v<pdf2md::MarkdownWriter>);
+static_assert(std::is_nothrow_move_constructible_v<pdf2md::MarkdownWriter> &&
+              std::is_nothrow_move_assignable_v<pdf2md::MarkdownWriter>);
+
+TEST(MarkdownWriter, PimplInstanceSupportsCopyMoveAndStatelessMultiDocumentReuse) {
+    constexpr int kHeadingH2 = 2;
+    constexpr int kPageZero = 0;
+    constexpr int kPageOne = 1;
+    constexpr int kTwoPages = 2;
+    constexpr int kSinglePage = 1;
+    constexpr int kTopListIndent = 0;
+
+    auto make_heading_on_page = [](int level, const char32_t* title, int page) {
+        Block h;
+        h.kind = BlockKind::Heading;
+        h.page = page;
+        h.heading_level = level;
+        h.size = kHeadingFontSize;
+        h.lines.push_back(make_line({StyledRun{title}}));
+        return h;
+    };
+
+    auto make_list_item_on_page = [](const char32_t* marker, bool ordered, const char32_t* text,
+                                     int page) {
+        Block item;
+        item.kind = BlockKind::ListItem;
+        item.page = page;
+        item.size = kDefaultFontSize;
+        item.list_marker = marker;
+        item.list_ordered = ordered;
+        item.list_indent = kTopListIndent;
+        item.lines.push_back(make_line({StyledRun{text}}));
+        return item;
+    };
+
+    // Document 1 exercises duplicate TOC slugs, hyperlinks, page breaks (page 0 -> 1),
+    // unordered list state, and a numbered footnote definition.
+    Document doc1;
+    doc1.meta.title = "First Spec";
+    doc1.meta.author = "Ada Lovelace";
+    doc1.meta.page_count = kTwoPages;
+
+    StyledRun fn_ref;
+    fn_ref.text = U"[^1]";
+    fn_ref.raw = true;
+
+    doc1.blocks.push_back(make_heading_on_page(kHeadingH2, U"Architecture", kPageZero));
+    doc1.blocks.push_back(
+        make_paragraph({StyledRun{U"Claim "},
+                        make_link_run(U"Guide", "https://example.org/one"), fn_ref},
+                       kPageZero));
+    doc1.blocks.push_back(make_heading_on_page(kHeadingH2, U"Architecture", kPageOne));
+    doc1.blocks.push_back(make_list_item_on_page(U"-", false, U"First doc bullet", kPageOne));
+
+    Block numbered_fn;
+    numbered_fn.kind = BlockKind::Paragraph;
+    numbered_fn.page = kPageOne;
+    numbered_fn.size = kFootnoteFontSize;
+    numbered_fn.is_footnote = true;
+    numbered_fn.footnote_numbered = true;
+    numbered_fn.footnote_label = U"1";
+    numbered_fn.lines.push_back(make_line({StyledRun{U"First doc note."}}));
+    doc1.blocks.push_back(std::move(numbered_fn));
+
+    // Document 2 reuses the same heading title on page 0, starts with an ordered list,
+    // and carries no author or footnotes — catching any slug, page-break, list, or
+    // footnote bleed from Document 1.
+    Document doc2;
+    doc2.meta.title = "Second Spec";
+    doc2.meta.page_count = kSinglePage;
+    doc2.blocks.push_back(make_heading_on_page(kHeadingH2, U"Architecture", kPageZero));
+    doc2.blocks.push_back(make_list_item_on_page(U"1.", true, U"Clean start", kPageZero));
+    doc2.blocks.push_back(make_paragraph(
+        {StyledRun{U"See "}, make_link_run(U"Portal", "https://example.org/two")}, kPageZero));
+
+    WriteOptions rich_opts;
+    rich_opts.front_matter = true;
+    rich_opts.page_breaks = true;
+    rich_opts.toc = true;
+    rich_opts.links = true;
+    rich_opts.source_name = "batch.pdf";
+
+    const std::string expected_doc1 =
+        "---\n"
+        "title: \"First Spec\"\n"
+        "author: \"Ada Lovelace\"\n"
+        "source: \"batch.pdf\"\n"
+        "pages: 2\n"
+        "---\n\n"
+        "- [Architecture](#architecture)\n"
+        "- [Architecture](#architecture-1)\n\n"
+        "## Architecture\n\n"
+        "Claim [Guide](https://example.org/one)[^1]\n\n"
+        "---\n\n"
+        "## Architecture\n\n"
+        "- First doc bullet\n\n"
+        "[^1]: First doc note.\n";
+
+    const std::string expected_doc2 =
+        "---\n"
+        "title: \"Second Spec\"\n"
+        "source: \"batch.pdf\"\n"
+        "pages: 1\n"
+        "---\n\n"
+        "- [Architecture](#architecture)\n\n"
+        "## Architecture\n\n"
+        "1. Clean start\n\n"
+        "See [Portal](https://example.org/two)\n";
+
+    const pdf2md::MarkdownWriter rich_writer(rich_opts);
+    EXPECT_EQ(rich_writer.write(doc1), expected_doc1);
+    EXPECT_EQ(rich_writer.write(doc1), pdf2md::write_markdown(doc1, rich_opts));
+    EXPECT_EQ(rich_writer.write(doc2), expected_doc2);
+    EXPECT_EQ(rich_writer.write(doc2), pdf2md::write_markdown(doc2, rich_opts));
+    EXPECT_EQ(rich_writer.write(doc1), expected_doc1);
+
+    WriteOptions minimal_opts;
+    minimal_opts.links = false;
+    const std::string expected_plain_doc2 =
+        "## Architecture\n\n"
+        "1. Clean start\n\n"
+        "See Portal\n";
+
+    pdf2md::MarkdownWriter mutable_writer(minimal_opts);
+    EXPECT_EQ(mutable_writer.write(doc2), expected_plain_doc2);
+    EXPECT_EQ(mutable_writer.write(doc2), pdf2md::write_markdown(doc2, minimal_opts));
+
+    // Copy construction, copy assignment, and self-copy assignment safety.
+    const pdf2md::MarkdownWriter copied_writer(rich_writer);
+    EXPECT_EQ(copied_writer.write(doc2), expected_doc2);
+
+    mutable_writer = copied_writer;
+    const pdf2md::MarkdownWriter& self_alias = mutable_writer;
+    mutable_writer = self_alias;
+    EXPECT_EQ(mutable_writer.write(doc1), expected_doc1);
+    EXPECT_EQ(mutable_writer.write(doc2), expected_doc2);
+
+    // Move construction, move assignment, and reassignment of a moved-from instance.
+    pdf2md::MarkdownWriter move_constructed(std::move(mutable_writer));
+    EXPECT_EQ(move_constructed.write(doc1), expected_doc1);
+
+    pdf2md::MarkdownWriter move_assigned(minimal_opts);
+    move_assigned = std::move(move_constructed);
+    EXPECT_EQ(move_assigned.write(doc2), expected_doc2);
+
+    mutable_writer = pdf2md::MarkdownWriter(minimal_opts);
+    EXPECT_EQ(mutable_writer.write(doc2), expected_plain_doc2);
 }
 
 }  // namespace

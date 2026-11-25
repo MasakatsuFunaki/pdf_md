@@ -286,4 +286,210 @@ TEST(SpaceClassification, ClassifiesAsciiCharacterRanges) {
     }
 }
 
+constexpr CpPredicateCase kLineBreakCases[] = {
+    {"horizontal_tab_below_lf", 0x0009U, false},
+    {"line_feed_lf", 0x000AU, true},
+    {"vertical_tab_above_lf", 0x000BU, false},
+    {"form_feed_below_cr", 0x000CU, false},
+    {"carriage_return_cr", 0x000DU, true},
+    {"shift_out_above_cr", 0x000EU, false},
+    {"ascii_space_not_line_break", 0x0020U, false},
+    {"del_sign_seam_low", 0x007FU, false},
+    {"pad_sign_seam_high", 0x0080U, false},
+    {"index_below_nel", 0x0084U, false},
+    {"next_line_nel", 0x0085U, true},
+    {"start_selected_area_above_nel", 0x0086U, false},
+    {"hyphenation_point_below_line_sep", 0x2027U, false},
+    {"unicode_line_separator", 0x2028U, true},
+    {"unicode_paragraph_separator", 0x2029U, true},
+    {"left_to_right_embedding_above_para_sep", 0x202AU, false},
+    {"above_unicode_max", 0x110000U, false},
+};
+
+constexpr std::size_t kExpectedLineBreakCaseCount = 17;
+static_assert(std::size(kLineBreakCases) == kExpectedLineBreakCaseCount);
+
+TEST(SpaceClassification, RecognizesLineBreakBoundariesAndSpaceDisjointness) {
+    ASSERT_EQ(std::size(kLineBreakCases), kExpectedLineBreakCaseCount);
+    for (const auto& tc : kLineBreakCases) {
+        SCOPED_TRACE(tc.name);
+        EXPECT_EQ(pdf2md::is_line_break_cp(tc.cp), tc.expected);
+        EXPECT_FALSE(pdf2md::is_line_break_cp(tc.cp) && pdf2md::is_space_cp(tc.cp));
+    }
+}
+
+struct AsciiLowerCase {
+    const char* name;
+    char32_t cp;
+    char expected;
+};
+
+constexpr AsciiLowerCase kAsciiLowerCases[] = {
+    {"nul_preserved", 0x0000U, '\0'},
+    {"digit_zero_unchanged", U'0', '0'},
+    {"at_sign_below_upper_a", U'@', '@'},
+    {"upper_a_min", U'A', 'a'},
+    {"upper_m_interior", U'M', 'm'},
+    {"upper_z_max", U'Z', 'z'},
+    {"left_bracket_above_upper_z", U'[', '['},
+    {"grave_below_lower_a", U'`', '`'},
+    {"lower_a_unchanged", U'a', 'a'},
+    {"lower_z_unchanged", U'z', 'z'},
+    {"left_brace_above_lower_z", U'{', '{'},
+    {"del_sign_seam_low", 0x007FU, '\x7F'},
+    {"c1_sign_seam_high", 0x0080U, static_cast<char>(0x80U)},
+    {"non_ascii_sharing_low_byte_with_upper_a_not_lowercased", 0x0141U, '\x41'},
+};
+
+constexpr std::size_t kExpectedAsciiLowerCaseCount = 14;
+static_assert(std::size(kAsciiLowerCases) == kExpectedAsciiLowerCaseCount);
+
+TEST(CharacterClassification, ConvertsAsciiToLowerAcrossCaseAndHighByteSeams) {
+    ASSERT_EQ(std::size(kAsciiLowerCases), kExpectedAsciiLowerCaseCount);
+    for (const auto& tc : kAsciiLowerCases) {
+        SCOPED_TRACE(tc.name);
+        EXPECT_EQ(pdf2md::ascii_tolower(tc.cp), tc.expected);
+    }
+}
+
+struct GreekAndLetterCase {
+    const char* name;
+    char32_t cp;
+    bool expected_greek;
+    bool expected_letter;
+};
+
+constexpr GreekAndLetterCase kGreekAndLetterCases[] = {
+    {"at_sign_below_ascii_upper", U'@', false, false},
+    {"ascii_upper_a", U'A', false, true},
+    {"ascii_upper_z", U'Z', false, true},
+    {"left_bracket_above_ascii_upper", U'[', false, false},
+    {"grave_below_ascii_lower", U'`', false, false},
+    {"ascii_lower_a", U'a', false, true},
+    {"ascii_lower_z", U'z', false, true},
+    {"left_brace_above_ascii_lower", U'{', false, false},
+    {"ascii_digit_not_letter", U'5', false, false},
+
+    {"below_greek_upper_alpha", 0x0390U, false, false},
+    {"greek_upper_alpha_min", 0x0391U, true, true},
+    {"greek_upper_pi_interior", 0x03A0U, true, true},
+    {"greek_upper_omega_max", 0x03A9U, true, true},
+    {"above_greek_upper_omega", 0x03AAU, false, false},
+
+    {"below_greek_lower_alpha", 0x03B0U, false, false},
+    {"greek_lower_alpha_min", 0x03B1U, true, true},
+    {"greek_lower_mu_interior", 0x03BCU, true, true},
+    {"greek_lower_omega_max", 0x03C9U, true, true},
+    {"above_greek_lower_omega", 0x03CAU, false, false},
+
+    {"below_theta_symbol", 0x03D0U, false, false},
+    {"greek_theta_symbol", 0x03D1U, true, true},
+    {"upsilon_hook_above_theta_symbol", 0x03D2U, false, false},
+    {"below_phi_symbol", 0x03D4U, false, false},
+    {"greek_phi_symbol", 0x03D5U, true, true},
+    {"greek_pi_symbol", 0x03D6U, true, true},
+    {"kai_symbol_above_pi_symbol", 0x03D7U, false, false},
+    {"kappa_symbol_below_rho_symbol", 0x03F0U, false, false},
+    {"greek_rho_symbol", 0x03F1U, true, true},
+    {"lunate_sigma_above_rho_symbol", 0x03F2U, false, false},
+    {"capital_theta_below_lunate_epsilon", 0x03F4U, false, false},
+    {"greek_lunate_epsilon_symbol", 0x03F5U, true, true},
+    {"reversed_lunate_epsilon_above", 0x03F6U, false, false},
+    {"cjk_ideograph_not_ascii_or_greek_letter", 0x4E2DU, false, false},
+};
+
+constexpr std::size_t kExpectedGreekLetterCaseCount = 33;
+static_assert(std::size(kGreekAndLetterCases) == kExpectedGreekLetterCaseCount);
+
+TEST(CharacterClassification, ClassifiesGreekAndLetterRangeSeams) {
+    ASSERT_EQ(std::size(kGreekAndLetterCases), kExpectedGreekLetterCaseCount);
+    for (const auto& tc : kGreekAndLetterCases) {
+        SCOPED_TRACE(tc.name);
+        EXPECT_EQ(pdf2md::is_greek_cp(tc.cp), tc.expected_greek);
+        EXPECT_EQ(pdf2md::is_letter_cp(tc.cp), tc.expected_letter);
+    }
+}
+
+struct BulletAndDashCase {
+    const char* name;
+    char32_t cp;
+    bool expected_bullet;
+    bool expected_dashy;
+};
+
+constexpr BulletAndDashCase kBulletAndDashCases[] = {
+    {"right_paren_below_asterisk", U')', false, false},
+    {"ascii_asterisk_bullet", U'*', true, false},
+    {"plus_sign_above_asterisk", U'+', false, false},
+    {"comma_below_hyphen", U',', false, false},
+    {"ascii_hyphen_dashy", U'-', false, true},
+    {"period_above_hyphen", U'.', false, false},
+    {"soft_hyphen_not_dashy", pdf2md::kSoftHyphenCp, false, false},
+
+    {"pilcrow_below_middle_dot", 0x00B6U, false, false},
+    {"middle_dot_bullet", 0x00B7U, true, false},
+    {"cedilla_above_middle_dot", 0x00B8U, false, false},
+
+    {"unicode_hyphen_not_dashy", pdf2md::kUnicodeHyphenCp, false, false},
+    {"figure_dash_below_en_dash", 0x2012U, false, false},
+    {"en_dash_min", 0x2013U, false, true},
+    {"em_dash_max", 0x2014U, false, true},
+    {"horizontal_bar_above_em_dash", 0x2015U, false, false},
+
+    {"double_dagger_below_bullet_pair", 0x2021U, false, false},
+    {"round_bullet_min", 0x2022U, true, false},
+    {"triangular_bullet_max", 0x2023U, true, false},
+    {"one_dot_leader_above_bullet_pair", 0x2024U, false, false},
+
+    {"hyphen_bullet_isolated", 0x2043U, true, false},
+    {"fraction_slash_above_hyphen_bullet", 0x2044U, false, false},
+    {"bullet_operator", 0x2219U, true, false},
+    {"square_root_above_bullet_operator", 0x221AU, false, false},
+
+    {"black_square_bullet", 0x25A0U, true, false},
+    {"white_square_interior_hole_not_bullet", 0x25A1U, false, false},
+    {"black_small_square_bullet", 0x25AAU, true, false},
+    {"white_circle_bullet", 0x25CBU, true, false},
+    {"dotted_circle_interior_hole_not_bullet", 0x25CCU, false, false},
+    {"black_circle_bullet", 0x25CFU, true, false},
+    {"white_bullet", 0x25E6U, true, false},
+    {"ballot_box_not_plain_bullet", 0x2610U, false, false},
+};
+
+constexpr std::size_t kExpectedBulletDashCaseCount = 31;
+static_assert(std::size(kBulletAndDashCases) == kExpectedBulletDashCaseCount);
+
+TEST(CharacterClassification, ClassifiesBulletAndDashRangeSeams) {
+    ASSERT_EQ(std::size(kBulletAndDashCases), kExpectedBulletDashCaseCount);
+    for (const auto& tc : kBulletAndDashCases) {
+        SCOPED_TRACE(tc.name);
+        EXPECT_EQ(pdf2md::is_bullet_cp(tc.cp), tc.expected_bullet);
+        EXPECT_EQ(pdf2md::is_dashy_cp(tc.cp), tc.expected_dashy);
+    }
+}
+
+TEST(Utf8Path, RoundTripsUnicodePathsAndNormalizesGenericSlashes) {
+    const std::filesystem::path empty_path = pdf2md::path_from_utf8("");
+    EXPECT_EQ(empty_path, std::filesystem::path{});
+    EXPECT_EQ(pdf2md::path_to_utf8(empty_path), "");
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(empty_path), "");
+
+    constexpr std::string_view kUnicodeRel =
+        "docs/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_\xCE\xB1_\xF0\x9F\x9A\x80/page 1.md"sv;
+    const std::filesystem::path decoded = pdf2md::path_from_utf8(kUnicodeRel);
+    EXPECT_EQ(decoded.filename().u32string(), U"page 1.md");
+    EXPECT_EQ(decoded.parent_path().filename().u32string(),
+              U"\u65E5\u672C\u8A9E_\u03B1_\U0001F680");
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(decoded), std::string(kUnicodeRel));
+    EXPECT_EQ(pdf2md::path_to_utf8(pdf2md::path_from_utf8(
+                  "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_\xF0\x9F\x93\x84.pdf")),
+              "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_\xF0\x9F\x93\x84.pdf");
+
+    constexpr std::string_view kBackslashInput =
+        "assets\\\xE5\x9B\xB3_\xF0\x9F\x93\x84\\fig_01.png"sv;
+    const std::filesystem::path win_style = pdf2md::path_from_utf8(kBackslashInput);
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(win_style),
+              "assets/\xE5\x9B\xB3_\xF0\x9F\x93\x84/fig_01.png");
+}
+
 }  // namespace

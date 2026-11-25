@@ -1,6 +1,7 @@
 // Component tests for the `pdf2md::Converter` public facade over synthetic PDFs.
 
-#include "converter.h"
+#include "pdf2md/converter.h"
+#include "pdf2md/pdf_extractor.h"
 
 #include "fixture_pdfs.h"
 
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -107,14 +109,13 @@ TEST(BasicFixture, DefaultPipelineReconstructsStructureIdempotentlyWithoutMutati
                 HasSubstr("The converter must detect **bold text** and also *italic text* "
                           "inside a sentence."));
 
-    // Nested unordered list, ordered list, and fenced monospace code block.
+    // Nested unordered list, blank-line separation into ordered list, and fenced code block.
     EXPECT_THAT(first.markdown,
                 HasSubstr("- First bullet item\n"
                           "- Second bullet item\n"
                           "    - Nested bullet item\n"
-                          "- Third bullet item\n"));
-    EXPECT_THAT(first.markdown,
-                HasSubstr("1. Alpha step\n"
+                          "- Third bullet item\n\n"
+                          "1. Alpha step\n"
                           "2. Beta step\n"
                           "3. Gamma step\n"));
     EXPECT_THAT(first.markdown, HasSubstr("```\nint main() {\n    return 42;\n}\n```"));
@@ -820,6 +821,339 @@ TEST(ErrorHandling, MidBatchFaultIsolatesPriorArtifactsWritesZeroPartialPngsAndR
     EXPECT_EQ(res4.page_count, 1U);
     EXPECT_EQ(res4.block_count, 3U);
     EXPECT_THAT(res4.markdown, HasSubstr("| Cherries | 31 | 4.20 |"));
+}
+
+TEST(RichFeatures, EndToEndLinksOutlinesMetadataFormattingTablesTasksAndCaptionedPngs) {
+    const testfx::ScopedSandbox sandbox("rich_e2e");
+    const fs::path rich_pdf = sandbox.file("rich_features.pdf");
+    const fs::path math_pdf = sandbox.file("math_and_tasks.pdf");
+    testfx::make_rich_features(rich_pdf);
+    testfx::make_math_and_tasks(math_pdf);
+
+    const std::vector<std::uint8_t> rich_bytes_before = testfx::read_binary_bytes(rich_pdf);
+    const std::vector<std::uint8_t> math_bytes_before = testfx::read_binary_bytes(math_pdf);
+
+    pdf2md::ConvertOptions opts;
+    opts.extract.extract_images = true;
+    opts.extract.image_dir = sandbox.file("rich_assets");
+    opts.extract.image_ref_prefix = "rich_assets/";
+    opts.write.front_matter = true;
+    opts.write.source_name = "rich_spec.pdf";
+    opts.write.toc = true;
+    const pdf2md::Converter converter(opts);
+
+    // Document #1: 2-page rich PDF with metadata, outlines, links, strikethrough,
+    // thematic divider rule, task list, aligned table columns, and captioned figure.
+    const pdf2md::ConvertResult r1 = converter.convert(rich_pdf);
+    EXPECT_EQ(r1.page_count, 2U);
+    EXPECT_GE(r1.block_count, 12U);
+
+    EXPECT_THAT(r1.markdown,
+                StartsWith("---\n"
+                           "title: \"Quarterly Architecture Specification\"\n"
+                           "author: \"Ada Lovelace\"\n"
+                           "subject: \"Systems Conversion Pipeline\"\n"
+                           "keywords: [\"pdf\", \"markdown\", \"layout\"]\n"
+                           "date: \"2026-03-15T14:30:00Z\"\n"
+                           "modified: \"2026-03-16T08:45:00+02:00\"\n"
+                           "source: \"rich_spec.pdf\"\n"
+                           "pages: 2\n"
+                           "---\n\n"));
+
+    // Hierarchical TOC precedes body sections and reflects child `/FitH` bookmark promotion.
+    const std::size_t toc_overview = r1.markdown.find("[Overview Section](#overview-section)");
+    const std::size_t toc_sub =
+        r1.markdown.find("  - [Bookmark Promoted Subsection](#bookmark-promoted-subsection)");
+    const std::size_t toc_matrix =
+        r1.markdown.find("[Verification Matrix](#verification-matrix)");
+    const std::size_t body_overview = r1.markdown.find("## Overview Section\n");
+    EXPECT_NE(toc_overview, std::string::npos);
+    EXPECT_NE(toc_sub, std::string::npos);
+    EXPECT_NE(toc_matrix, std::string::npos);
+    EXPECT_NE(body_overview, std::string::npos);
+    if (toc_overview != std::string::npos && toc_sub != std::string::npos &&
+        toc_matrix != std::string::npos && body_overview != std::string::npos) {
+        EXPECT_LT(toc_overview, toc_sub);
+        EXPECT_LT(toc_sub, toc_matrix);
+        EXPECT_LT(toc_matrix, body_overview);
+    }
+    EXPECT_THAT(r1.markdown, HasSubstr("### Bookmark Promoted Subsection\n"));
+    EXPECT_THAT(r1.markdown, HasSubstr("## Verification Matrix\n"));
+
+    // Explicit URI link annotation + implicit WebLink destination preserved intact.
+    EXPECT_THAT(r1.markdown,
+                HasSubstr("Consult the [architecture guide](https://example.org/arch-guide)"));
+    EXPECT_THAT(
+        r1.markdown,
+        HasSubstr("[https://example.org/docs\\_v2/\\~spec](https://example.org/docs_v2/~spec)"));
+
+    // Both StrikeOut annotation and thin vector midline rule render as `~~...~~`.
+    EXPECT_THAT(r1.markdown,
+                HasSubstr("Retire ~~deprecated endpoint~~ and ~~obsolete token~~ immediately."));
+
+    // Standalone horizontal divider rule and unescaped GFM task list items.
+    EXPECT_THAT(r1.markdown,
+                HasSubstr("Paragraph above the thematic section divider.\n\n---\n\n"));
+    EXPECT_THAT(r1.markdown,
+                HasSubstr("- [ ] Draft protocol schema\n"
+                          "- [x] Validate binary framing\n"
+                          "    - [x] Record golden checksums\n"));
+
+    // Center-aligned (`:---:`) and right-aligned (`---:`) table columns.
+    EXPECT_THAT(r1.markdown,
+                HasSubstr("| Component | Status | Latency |\n"
+                          "| --- | :---: | ---: |\n"
+                          "| Extractor | OK | 9 |\n"
+                          "| Layout Engine | VERIFIED | 1,240 |\n"
+                          "| Writer | PASS | 128,500 |"));
+
+    // Adjacent `Figure 1:` caption populates `image_alt` while keeping visible caption below.
+    const std::vector<testfx::MarkdownImageEmbed> r1_imgs =
+        testfx::extract_markdown_images(r1.markdown);
+    ASSERT_EQ(r1_imgs.size(), 1U);
+    EXPECT_EQ(r1_imgs[0].alt, "Figure 1: Pipeline stage throughput overview.");
+    EXPECT_EQ(r1_imgs[0].path, "rich_assets/image_1.png");
+    EXPECT_THAT(
+        r1.markdown,
+        HasSubstr("![Figure 1: Pipeline stage throughput overview.](rich_assets/image_1.png)\n\n"
+                  "Figure 1: Pipeline stage throughput overview."));
+    verify_all_embedded_pngs(r1.markdown, sandbox.path(), 1U);
+
+    // Document #2 on the SAME `Converter`: rule-anchored `\frac`, vinculum + indexed
+    // `\sqrt`, Unicode ballot-box task list, and Tagged PDF `/StructTreeRoot` `/Alt`.
+    const pdf2md::ConvertResult r2 = converter.convert(math_pdf);
+    EXPECT_EQ(r2.page_count, 1U);
+    EXPECT_GE(r2.block_count, 6U);
+    EXPECT_THAT(r2.markdown, Not(HasSubstr("Ada Lovelace")));
+    EXPECT_THAT(r2.markdown, Not(HasSubstr("Systems Conversion Pipeline")));
+    EXPECT_THAT(r2.markdown, HasSubstr("pages: 1\n"));
+
+    EXPECT_THAT(r2.markdown, HasSubstr("\\frac{x+1}{y+2}"));
+    EXPECT_THAT(r2.markdown, HasSubstr("\\sqrt{2\\pi}"));
+    EXPECT_THAT(r2.markdown, HasSubstr("\\sqrt[3]{z+1}"));
+    EXPECT_THAT(r2.markdown,
+                HasSubstr("- [ ] Calibrate optical baseline\n"
+                          "- [x] Verify vinculum geometry\n"));
+
+    const std::vector<testfx::MarkdownImageEmbed> r2_imgs =
+        testfx::extract_markdown_images(r2.markdown);
+    ASSERT_EQ(r2_imgs.size(), 1U);
+    EXPECT_EQ(r2_imgs[0].alt, "Tagged schematic alt description");
+    EXPECT_EQ(r2_imgs[0].path, "rich_assets/image_1.png");
+    verify_all_embedded_pngs(r2.markdown, sandbox.path(), 1U);
+
+    // Document #3: idempotent replay of Document #1 on the same `Converter`.
+    const pdf2md::ConvertResult r3 = converter.convert(rich_pdf);
+    EXPECT_EQ(r3.page_count, r1.page_count);
+    EXPECT_EQ(r3.block_count, r1.block_count);
+    EXPECT_EQ(r3.markdown, r1.markdown);
+
+    EXPECT_EQ(testfx::read_binary_bytes(rich_pdf), rich_bytes_before);
+    EXPECT_EQ(testfx::read_binary_bytes(math_pdf), math_bytes_before);
+}
+
+TEST(RichFeatures, InterleavedLinkAndTocOptionTogglesControlExtractorAndWriterStages) {
+    const testfx::ScopedSandbox sandbox("rich_toggles");
+    const fs::path rich_pdf = sandbox.file("rich_features.pdf");
+    const fs::path math_pdf = sandbox.file("math_and_tasks.pdf");
+    testfx::make_rich_features(rich_pdf);
+    testfx::make_math_and_tasks(math_pdf);
+
+    const std::vector<std::uint8_t> rich_bytes_before = testfx::read_binary_bytes(rich_pdf);
+    const std::vector<std::uint8_t> math_bytes_before = testfx::read_binary_bytes(math_pdf);
+
+    // 1. Disabling link extraction (`extract.extract_links = false`) drops URI annotations
+    //    at extraction while keeping bare prose URLs intact without `\_` or `\~` escaping.
+    pdf2md::ConvertOptions no_extract_links_opts;
+    no_extract_links_opts.extract.extract_links = false;
+    const pdf2md::Converter no_extract_conv(no_extract_links_opts);
+    const pdf2md::ConvertResult no_ext_rich = no_extract_conv.convert(rich_pdf);
+    const pdf2md::ConvertResult no_ext_math = no_extract_conv.convert(math_pdf);
+    EXPECT_EQ(no_ext_rich.page_count, 2U);
+    EXPECT_EQ(no_ext_math.page_count, 1U);
+    EXPECT_THAT(no_ext_rich.markdown, HasSubstr("Consult the architecture guide or mirror "));
+    EXPECT_THAT(no_ext_rich.markdown, Not(HasSubstr("https://example.org/arch-guide")));
+    EXPECT_THAT(no_ext_rich.markdown, HasSubstr("https://example.org/docs_v2/~spec"));
+    EXPECT_THAT(no_ext_rich.markdown, Not(HasSubstr("](https://example.org/docs_v2/~spec)")));
+    EXPECT_THAT(no_ext_rich.markdown, Not(HasSubstr("docs\\_v2")));
+    EXPECT_THAT(no_ext_rich.markdown, Not(HasSubstr("\\~spec")));
+
+    // 2. Keeping `extract_links = true` while setting `write.links = false` suppresses
+    //    Markdown `[label](url)` link emission at the writer boundary.
+    pdf2md::ConvertOptions no_write_links_opts;
+    no_write_links_opts.write.links = false;
+    const pdf2md::Converter no_write_conv(no_write_links_opts);
+    const pdf2md::ConvertResult no_wr_rich = no_write_conv.convert(rich_pdf);
+    EXPECT_EQ(no_wr_rich.page_count, 2U);
+    EXPECT_THAT(no_wr_rich.markdown, HasSubstr("Consult the architecture guide or mirror "));
+    EXPECT_THAT(no_wr_rich.markdown, Not(HasSubstr("https://example.org/arch-guide")));
+    EXPECT_THAT(no_wr_rich.markdown, HasSubstr("https://example.org/docs_v2/~spec"));
+    EXPECT_THAT(no_wr_rich.markdown, Not(HasSubstr("](https://example.org/docs_v2/~spec)")));
+    EXPECT_THAT(no_wr_rich.markdown, Not(HasSubstr("docs\\_v2")));
+    EXPECT_THAT(no_wr_rich.markdown, Not(HasSubstr("\\~spec")));
+
+    // 3. Default `write.toc = false` keeps outline-promoted headings in the body while
+    //    omitting TOC anchor bullets; copy-constructed `Converter` preserves PIMPL state.
+    const pdf2md::Converter default_conv(pdf2md::ConvertOptions{});
+    const pdf2md::Converter copied_conv(default_conv);
+    const pdf2md::ConvertResult without_toc = copied_conv.convert(rich_pdf);
+    EXPECT_THAT(without_toc.markdown, HasSubstr("## Overview Section\n"));
+    EXPECT_THAT(without_toc.markdown, HasSubstr("### Bookmark Promoted Subsection\n"));
+    EXPECT_THAT(without_toc.markdown, Not(HasSubstr("](#overview-section)")));
+    EXPECT_THAT(without_toc.markdown, Not(HasSubstr("](#bookmark-promoted-subsection)")));
+
+    pdf2md::ConvertOptions toc_only_opts;
+    toc_only_opts.write.toc = true;
+    const pdf2md::Converter toc_conv(toc_only_opts);
+    const pdf2md::ConvertResult with_toc = toc_conv.convert(rich_pdf);
+    EXPECT_THAT(with_toc.markdown, HasSubstr("[Overview Section](#overview-section)"));
+    EXPECT_THAT(with_toc.markdown,
+                HasSubstr("  - [Bookmark Promoted Subsection](#bookmark-promoted-subsection)"));
+
+    EXPECT_EQ(testfx::read_binary_bytes(rich_pdf), rich_bytes_before);
+    EXPECT_EQ(testfx::read_binary_bytes(math_pdf), math_bytes_before);
+}
+
+static_assert(std::is_copy_constructible_v<pdf2md::Converter>);
+static_assert(std::is_copy_assignable_v<pdf2md::Converter>);
+static_assert(std::is_nothrow_move_constructible_v<pdf2md::Converter> &&
+              std::is_nothrow_move_assignable_v<pdf2md::Converter>);
+
+static_assert(std::is_copy_constructible_v<pdf2md::PdfExtractor>);
+static_assert(std::is_copy_assignable_v<pdf2md::PdfExtractor>);
+static_assert(std::is_nothrow_move_constructible_v<pdf2md::PdfExtractor> &&
+              std::is_nothrow_move_assignable_v<pdf2md::PdfExtractor>);
+
+TEST(PdfExtractorPimpl, CopyMoveAndSequentialExtractionsIsolateMetadataLinksAndImages) {
+    constexpr std::size_t kRichPageCount = 2U;
+    constexpr std::size_t kTwoColPageCount = 1U;
+    constexpr std::size_t kSubsetPageCount = 1U;
+    constexpr std::size_t kRichOutlineCount = 3U;
+    constexpr std::size_t kRichPage0LinkCount = 2U;
+    constexpr std::size_t kSingleImageCount = 1U;
+    constexpr std::size_t kZeroCount = 0U;
+    constexpr std::uint8_t kExpectedBitDepth = 8U;
+    constexpr int kFirstPageIndex = 0;
+
+    const testfx::ScopedSandbox sandbox("extractor_pimpl");
+    const fs::path rich_pdf = sandbox.file("rich_features.pdf");
+    const fs::path twocol_pdf = sandbox.file("twocol.pdf");
+    const fs::path missing_pdf = sandbox.file("missing.pdf");
+    testfx::make_rich_features(rich_pdf);
+    testfx::make_twocol(twocol_pdf);
+
+    const std::vector<std::uint8_t> rich_bytes_before = testfx::read_binary_bytes(rich_pdf);
+    const std::vector<std::uint8_t> twocol_bytes_before = testfx::read_binary_bytes(twocol_pdf);
+
+    pdf2md::ExtractOptions full_opts;
+    full_opts.extract_images = true;
+    full_opts.image_dir = sandbox.file("ext_images");
+    full_opts.image_ref_prefix = "ext_images/";
+    full_opts.extract_links = true;
+
+    const pdf2md::PdfExtractor extractor(full_opts);
+
+    // Call #1: 2-page rich PDF extracts metadata, hierarchical outlines, links, and PNG figure.
+    const pdf2md::Extraction ex1 = extractor.extract(rich_pdf);
+    EXPECT_EQ(ex1.meta.title, "Quarterly Architecture Specification");
+    EXPECT_EQ(ex1.meta.author, "Ada Lovelace");
+    EXPECT_EQ(ex1.meta.subject, "Systems Conversion Pipeline");
+    EXPECT_EQ(ex1.meta.page_count, static_cast<int>(kRichPageCount));
+    ASSERT_EQ(ex1.meta.outlines.size(), kRichOutlineCount);
+    EXPECT_EQ(ex1.meta.outlines[0].title, "Overview Section");
+    EXPECT_EQ(ex1.meta.outlines[1].title, "Bookmark Promoted Subsection");
+    EXPECT_EQ(ex1.meta.outlines[2].title, "Verification Matrix");
+
+    ASSERT_EQ(ex1.pages.size(), kRichPageCount);
+    ASSERT_EQ(ex1.pages[0].links.size(), kRichPage0LinkCount);
+    EXPECT_EQ(ex1.pages[0].links[0].uri, "https://example.org/arch-guide");
+    EXPECT_EQ(ex1.pages[0].links[1].uri, "https://example.org/docs_v2/~spec");
+    ASSERT_EQ(ex1.pages[0].images.size(), kZeroCount);
+    ASSERT_EQ(ex1.pages[1].links.size(), kZeroCount);
+    ASSERT_EQ(ex1.pages[1].images.size(), kSingleImageCount);
+    EXPECT_EQ(ex1.pages[1].images[0].path, "ext_images/image_1.png");
+
+    // Verify extracted PNG via wire parser and real libharu (libpng+zlib) consumer.
+    const fs::path emitted_png = sandbox.file("ext_images/image_1.png");
+    ASSERT_TRUE(fs::exists(emitted_png));
+    const testfx::PngWireReport wire = testfx::inspect_png_wire(emitted_png);
+    ASSERT_TRUE(wire.valid) << wire.error;
+    EXPECT_EQ(wire.bit_depth, kExpectedBitDepth);
+    const testfx::PngConsumerReport consumer = testfx::consume_png_with_libharu(emitted_png);
+    ASSERT_TRUE(consumer.valid) << consumer.error;
+    EXPECT_EQ(consumer.width, wire.width);
+    EXPECT_EQ(consumer.height, wire.height);
+
+    // Call #2 on the SAME const PdfExtractor: distinct 1-page PDF has zero metadata,
+    // outline, link, or image bleed from Call #1.
+    const pdf2md::Extraction ex2 = extractor.extract(twocol_pdf);
+    EXPECT_EQ(ex2.meta.title, "Two Column Fixture");
+    EXPECT_EQ(ex2.meta.author, "");
+    EXPECT_EQ(ex2.meta.subject, "");
+    EXPECT_EQ(ex2.meta.keywords, "");
+    EXPECT_EQ(ex2.meta.page_count, static_cast<int>(kTwoColPageCount));
+    ASSERT_EQ(ex2.meta.outlines.size(), kZeroCount);
+    ASSERT_EQ(ex2.pages.size(), kTwoColPageCount);
+    ASSERT_EQ(ex2.pages[0].links.size(), kZeroCount);
+    ASSERT_EQ(ex2.pages[0].images.size(), kZeroCount);
+    ASSERT_EQ(list_regular_filenames_sorted(full_opts.image_dir).size(), kSingleImageCount);
+
+    // Mid-session fault throws PdfError cleanly, and subsequent replay resets image numbering.
+    EXPECT_THROW((void)extractor.extract(missing_pdf), pdf2md::PdfError);
+    const pdf2md::Extraction ex3 = extractor.extract(rich_pdf);
+    ASSERT_EQ(ex3.pages.size(), kRichPageCount);
+    EXPECT_EQ(ex3.meta.title, ex1.meta.title);
+    ASSERT_EQ(ex3.pages[1].images.size(), kSingleImageCount);
+    EXPECT_EQ(ex3.pages[1].images[0].path, "ext_images/image_1.png");
+
+    // Copy construction, copy assignment (with self-copy), and noexcept move semantics
+    // on both PdfExtractor and Converter PIMPL classes.
+    pdf2md::ExtractOptions subset_opts;
+    subset_opts.pages = {kFirstPageIndex};
+    subset_opts.extract_links = false;
+    subset_opts.extract_images = false;
+
+    pdf2md::PdfExtractor mutable_extractor(subset_opts);
+    const pdf2md::Extraction subset_ex = mutable_extractor.extract(rich_pdf);
+    const pdf2md::Extraction free_fn_ex = pdf2md::extract_pdf(rich_pdf, subset_opts);
+    ASSERT_EQ(subset_ex.pages.size(), kSubsetPageCount);
+    ASSERT_EQ(free_fn_ex.pages.size(), kSubsetPageCount);
+    EXPECT_EQ(subset_ex.pages[0].chars.size(), free_fn_ex.pages[0].chars.size());
+    ASSERT_EQ(subset_ex.pages[0].links.size(), kZeroCount);
+    ASSERT_EQ(subset_ex.pages[0].images.size(), kZeroCount);
+
+    const pdf2md::PdfExtractor copied_extractor(extractor);
+    mutable_extractor = copied_extractor;
+    const pdf2md::PdfExtractor& self_extractor = mutable_extractor;
+    mutable_extractor = self_extractor;
+
+    pdf2md::PdfExtractor move_constructed_ext(std::move(mutable_extractor));
+    pdf2md::PdfExtractor move_assigned_ext(subset_opts);
+    move_assigned_ext = std::move(move_constructed_ext);
+
+    const pdf2md::Extraction after_move_ex = move_assigned_ext.extract(rich_pdf);
+    ASSERT_EQ(after_move_ex.pages.size(), kRichPageCount);
+    ASSERT_EQ(after_move_ex.pages[0].links.size(), kRichPage0LinkCount);
+    ASSERT_EQ(after_move_ex.pages[1].images.size(), kSingleImageCount);
+
+    mutable_extractor = pdf2md::PdfExtractor(subset_opts);
+    ASSERT_EQ(mutable_extractor.extract(rich_pdf).pages.size(), kSubsetPageCount);
+
+    pdf2md::ConvertOptions toc_opts;
+    toc_opts.write.toc = true;
+    const pdf2md::Converter toc_conv(toc_opts);
+    pdf2md::Converter mutable_conv(pdf2md::ConvertOptions{});
+    mutable_conv = toc_conv;
+    const pdf2md::Converter& self_conv = mutable_conv;
+    mutable_conv = self_conv;
+    pdf2md::Converter move_assigned_conv(pdf2md::ConvertOptions{});
+    move_assigned_conv = std::move(mutable_conv);
+    const pdf2md::ConvertResult conv_res = move_assigned_conv.convert(rich_pdf);
+    EXPECT_EQ(conv_res.page_count, kRichPageCount);
+    EXPECT_THAT(conv_res.markdown, HasSubstr("[Overview Section](#overview-section)"));
+
+    EXPECT_EQ(testfx::read_binary_bytes(rich_pdf), rich_bytes_before);
+    EXPECT_EQ(testfx::read_binary_bytes(twocol_pdf), twocol_bytes_before);
 }
 
 }  // namespace
