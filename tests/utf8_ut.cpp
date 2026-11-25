@@ -485,11 +485,24 @@ TEST(Utf8Path, RoundTripsUnicodePathsAndNormalizesGenericSlashes) {
                   "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_\xF0\x9F\x93\x84.pdf")),
               "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E_\xF0\x9F\x93\x84.pdf");
 
+    const std::filesystem::path native_joined =
+        pdf2md::path_from_utf8("assets") /
+        pdf2md::path_from_utf8("\xE5\x9B\xB3_\xF0\x9F\x93\x84") /
+        pdf2md::path_from_utf8("fig_01.png");
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(native_joined),
+              "assets/\xE5\x9B\xB3_\xF0\x9F\x93\x84/fig_01.png");
+
+    // Per ISO C++20 [fs.path.generic] and POSIX.1-2017 3.271, '\\' is a directory
+    // separator on Windows (normalized to '/') and an ordinary filename byte on POSIX.
     constexpr std::string_view kBackslashInput =
         "assets\\\xE5\x9B\xB3_\xF0\x9F\x93\x84\\fig_01.png"sv;
-    const std::filesystem::path win_style = pdf2md::path_from_utf8(kBackslashInput);
-    EXPECT_EQ(pdf2md::path_to_utf8_generic(win_style),
+    const std::filesystem::path backslash_path = pdf2md::path_from_utf8(kBackslashInput);
+#ifdef _WIN32
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(backslash_path),
               "assets/\xE5\x9B\xB3_\xF0\x9F\x93\x84/fig_01.png");
+#else
+    EXPECT_EQ(pdf2md::path_to_utf8_generic(backslash_path), std::string(kBackslashInput));
+#endif
 }
 
 }  // namespace
