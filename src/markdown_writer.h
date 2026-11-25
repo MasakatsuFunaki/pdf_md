@@ -1,8 +1,8 @@
 #pragma once
 
-#include <string>
-
 #include "layout_analyzer.h"
+
+#include <string>
 
 namespace pdf2md {
 

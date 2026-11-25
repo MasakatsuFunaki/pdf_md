@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 
 #include <fpdfview.h>
@@ -10,7 +11,7 @@ namespace pdf2md {
 bool write_bitmap_png(FPDF_BITMAP bitmap, const std::filesystem::path& out_path);
 
 // FNV-1a hash of the bitmap pixel data, used to deduplicate repeated images.
-uint64_t hash_bitmap(FPDF_BITMAP bitmap);
+std::uint64_t hash_bitmap(FPDF_BITMAP bitmap);
 
 // Fraction of pixels darker than a near-white threshold -- how much "ink" the
 // bitmap carries. Used to tell a scanned diagram crop from blank paper.

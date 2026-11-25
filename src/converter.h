@@ -1,16 +1,17 @@
 #pragma once
 
-#include <cstddef>
-#include <filesystem>
-#include <string>
-
 #include "layout_analyzer.h"
 #include "markdown_writer.h"
 #include "pdf_extractor.h"
 
+#include <cstddef>
+#include <filesystem>
+#include <memory>
+#include <string>
+
 namespace pdf2md {
 
-// The options for each stage of the pipeline, bundled into one struct.
+// Options for each stage of the conversion pipeline, bundled into one aggregate.
 struct ConvertOptions {
     ExtractOptions extract;
     AnalyzeParams analyze;
@@ -23,19 +24,24 @@ struct ConvertResult {
     std::size_t block_count = 0;  // document blocks produced
 };
 
-// Facade: a single entry point over the three conversion subsystems
-// (pdf_extractor -> layout_analyzer -> markdown_writer). It bundles their
-// options and runs the extract -> analyze -> write pipeline in one call, so a
-// caller need not wire the stages together. The subsystems stay independently
-// usable and are still driven directly by the tests. convert() throws PdfError
-// on load/extraction failure, just as extract_pdf does.
+// Facade: unified entry point over the three conversion subsystems
+// (pdf_extractor -> layout_analyzer -> markdown_writer). Insulated via PIMPL;
+// concurrent const convert() calls are thread-safe. Throws PdfError on PDF
+// load/extraction failure.
 class Converter {
 public:
-    explicit Converter(ConvertOptions options);
+    explicit Converter(ConvertOptions options = {});
+    Converter(const Converter& other);
+    Converter& operator=(const Converter& other);
+    Converter(Converter&& other) noexcept;
+    Converter& operator=(Converter&& other) noexcept;
+    ~Converter();
+
     ConvertResult convert(const std::filesystem::path& input) const;
 
 private:
-    ConvertOptions options_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace pdf2md

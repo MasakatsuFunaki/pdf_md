@@ -11,6 +11,12 @@ struct CharInfo {
     double x = 0, y = 0;                              // baseline origin
     double left = 0, right = 0, bottom = 0, top = 0;  // glyph bounding box
     double size = 0;                                  // font size in points
+    // Em-box height as drawn, i.e. the em square pushed through the full text
+    // matrix. Unlike `size` this survives a scaling `cm`, so the two disagreeing
+    // is how a page with an inflated nominal size is recognised. Carried on the
+    // char rather than in a parallel array because glyphs are erased (figure
+    // labels) between extraction and the document-wide size repair.
+    double loose_height = 0;
     bool bold = false;
     bool italic = false;
     bool mono = false;

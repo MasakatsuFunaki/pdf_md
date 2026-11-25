@@ -1,13 +1,12 @@
 #pragma once
 
+#include "document_model.h"
+
 #include <filesystem>
-#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "document_model.h"
 
 namespace pdf2md {
 

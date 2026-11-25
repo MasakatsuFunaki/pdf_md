@@ -1,9 +1,11 @@
 #pragma once
 
-#include <string>
-#include <vector>
-
 #include "document_model.h"
+
+#include <cstddef>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace pdf2md {
 
@@ -77,6 +79,8 @@ struct Document {
     double body_size = 11.0;
 };
 
+// Thread-safe: pure function with zero shared mutable state; safe to invoke
+// concurrently across threads on independent inputs.
 Document analyze_layout(const DocMeta& meta, const std::vector<PageData>& pages,
                         const AnalyzeParams& params);
 

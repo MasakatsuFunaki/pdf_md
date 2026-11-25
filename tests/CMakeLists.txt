@@ -3,15 +3,17 @@ find_package(libharu REQUIRED CONFIG)
 
 add_executable(pdf2md_tests
     fixture_pdfs.cpp
-    conversion_test.cpp
-    corpus_test.cpp
-    layout_analyzer_test.cpp
-    markdown_writer_test.cpp
-    utf8_test.cpp
+    utf8_ut.cpp
+    markdown_writer_ut.cpp
+    image_extractor_ut.cpp
+    layout_analyzer_ut.cpp
+    converter_ct.cpp
+    corpus_ct.cpp
+    cli_st.cpp
     examples_export.cpp
 )
 target_compile_features(pdf2md_tests PRIVATE cxx_std_20)
-target_link_libraries(pdf2md_tests PRIVATE pdf2md_core libharu::libharu GTest::gmock_main)
+target_link_libraries(pdf2md_tests PRIVATE pdf2md_core pdfium::pdfium libharu::libharu GTest::gmock_main)
 # Real-world PDFs fetched by tests/corpus/download_corpus.ps1; the corpus
 # tests skip when this directory does not exist.
 target_compile_definitions(pdf2md_tests
